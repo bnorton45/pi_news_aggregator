@@ -1,0 +1,175 @@
+{{- if .Values.monitoring.enabled }}
+# Prometheus (zone-data, co-resident on the state node — PLAN §2). The ONE workload that
+# talks to the Kubernetes API: it uses in-cluster service discovery, so unlike every app SA
+# it mounts its token and carries a scoped ClusterRole. rbac.yaml foresees this ("monitoring
+# controllers bring their own RBAC"). Egress is already fenced by deploy/policies
+# netpol `prometheus-egress` (zones' named metrics ports + same-zone exporters + API :6443).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: zone-data
+# token REQUIRED here (kube SD) — the deliberate exception to the zero-token rule.
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: news-aggregator-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/metrics, nodes/proxy, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: news-aggregator-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: news-aggregator-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: zone-data
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: zone-data
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+    scrape_configs:
+      # Prometheus itself.
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Node/kubelet metrics via the API-server proxy (reachable on :6443 per the
+      # prometheus-egress netpol) — CPU, memory, filesystem, network per node.
+      - job_name: kubernetes-nodes
+        scheme: https
+        tls_config: { ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt }
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs: [{ role: node }]
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+
+      # Per-container resource metrics (cadvisor) via the same proxy — the 0b thermal/CPU/
+      # NVMe-under-load spikes read these.
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config: { ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt }
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs: [{ role: node }]
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+      # App pods opt in with prometheus.io/scrape="true" + prometheus.io/port on a named
+      # `metrics` container port (none expose one yet — this job lights up when they do).
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs: [{ role: pod }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: zone-data
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - { name: http, port: 9090, targetPort: 9090 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: zone-data
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus # netpol key (deploy/policies)
+    spec:
+      serviceAccountName: prometheus
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline # below state — never preempts Postgres/NATS
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 65534 | nindent 6 }}
+      containers:
+        - name: prometheus
+          image: {{ .Values.images.prometheus | quote }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.monitoring.prometheus.retention }}
+            - --web.enable-lifecycle
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 9090, name: http }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus, readOnly: true }
+            - { name: data, mountPath: /prometheus }
+          resources: {{- toYaml .Values.monitoring.prometheus.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.monitoring.prometheus.storage }}
+{{- end }}

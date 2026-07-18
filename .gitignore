@@ -1,0 +1,40 @@
+# ── Secrets & crown jewels (NEVER commit; see PLAN §3.5/§3.6) ────────────────
+*.age
+*.pem
+*.key
+age.key
+*.agekey
+kubeconfig
+*.kubeconfig
+.sops.decrypted.*
+**/decrypted/**
+*.dec.yaml
+*.dec.json
+.env
+.env.*
+!.env.example
+secrets.yaml
+!deploy/secrets/*.enc.yaml   # SOPS-encrypted ONLY are allowed (PLAN §8)
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# ── Models / data / scratch ──────────────────────────────────────────────────
+*.onnx
+models/
+.data/
+*.log
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/

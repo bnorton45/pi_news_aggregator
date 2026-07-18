@@ -1,0 +1,159 @@
+# Postgres + pgvector (zone-data). Schema (partitioned items/stories + HNSW helpers)
+# initializes on FIRST boot via docker-entrypoint-initdb.d; the file is the authored
+# libs/schema/schema.sql copied into files/ (sync enforced by tests/test_deploy_sync.py).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-schema
+  namespace: zone-data
+data:
+  10_schema.sql: |
+{{ .Files.Get "files/schema.sql" | indent 4 }}
+  20_readonly_role.sh: |
+{{ .Files.Get "files/readonly_role.sh" | indent 4 }}
+  30_retrain_role.sh: |
+{{ .Files.Get "files/retrain_role.sh" | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: zone-data
+spec:
+  selector:
+    app: postgres
+  ports:
+    - { name: pg, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: zone-data
+spec:
+  serviceName: postgres
+  replicas: 1 # cold-but-lossless failover by design (PLAN §6.8): no hot standby
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      serviceAccountName: postgres
+      automountServiceAccountToken: false
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-state
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 999 | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ .Values.images.postgres }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 5432, name: pg }
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-creds
+                  key: password
+            - name: POSTGRES_RO_PASSWORD # api_ro, created at first initdb (§6.8)
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-creds
+                  key: password-ro
+            - name: POSTGRES_RETRAIN_PASSWORD # retrain_ro, created at first initdb (§6.3)
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-creds
+                  key: password-retrain
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: schema, mountPath: /docker-entrypoint-initdb.d, readOnly: true }
+            - { name: run, mountPath: /var/run/postgresql }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}, "-d", {{ .Values.postgres.database | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: schema
+          configMap:
+            name: postgres-schema
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.postgres }}
+---
+# The 5-day wall (PLAN §4): provision tomorrow's partitions, drop those beyond
+# retention. Uses the postgres image itself (psql present, digest already pinned).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: partition-maintenance
+  namespace: zone-data
+spec:
+  schedule: {{ .Values.partitionCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: partition-cron # netpol: the only zone-data pod allowed into postgres
+        spec:
+          restartPolicy: Never
+          serviceAccountName: postgres
+          automountServiceAccountToken: false
+          {{- include "na.podSecurity" 999 | nindent 10 }}
+          containers:
+            - name: psql
+              image: {{ .Values.images.postgres }}
+              {{- include "na.containerSecurity" . | nindent 14 }}
+              command:
+                - psql
+                - -h
+                - postgres.zone-data.svc
+                - -U
+                - {{ .Values.postgres.user | quote }}
+                - -d
+                - {{ .Values.postgres.database | quote }}
+                - -v
+                - ON_ERROR_STOP=1
+                - -c
+                - SELECT provision_partitions();
+                - -c
+                - SELECT drop_old_partitions({{ .Values.partitionCron.retentionDays }});
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-creds
+                      key: password
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { cpu: 250m, memory: 128Mi }

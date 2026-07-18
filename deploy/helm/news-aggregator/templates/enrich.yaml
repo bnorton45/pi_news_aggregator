@@ -1,0 +1,63 @@
+# Enrich = INFERENCE worker (PLAN §3.3): parses untrusted text, therefore NO DB
+# credential and no route to zone-data:5432 (role=inference in the netpol).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enrich
+  namespace: zone-process
+spec:
+  replicas: {{ .Values.enrich.replicas }}
+  selector:
+    matchLabels:
+      app: enrich
+  template:
+    metadata:
+      labels:
+        app: enrich
+        role: inference
+    spec:
+      serviceAccountName: inference
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: enrich
+          image: {{ include "na.image" (list "enrich" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.enrich.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-enrich
+                  key: password
+            - name: NATS_URL
+              value: "nats://enrich:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: DEDUP_KV_BUCKET
+              value: {{ .Values.enrich.dedupBucket | quote }}
+            {{- if .Values.enrich.embedModelPath }}
+            # Baked int8 encoders (§6.3 step 3/4); unset ⇒ hash/no-op stubs (dev overlay).
+            - name: EMBED_MODEL_PATH
+              value: {{ .Values.enrich.embedModelPath | quote }}
+            {{- end }}
+            {{- if .Values.enrich.nerModelPath }}
+            - name: NER_MODEL_PATH
+              value: {{ .Values.enrich.nerModelPath | quote }}
+            {{- end }}
+            {{- if .Values.retrain.enabled }}
+            # §6.3 online retrain hot-swap: poll the models KV retrain publishes to.
+            # Only set when retrain runs — otherwise the bucket never exists.
+            - name: MODELS_KV_BUCKET
+              value: {{ .Values.retrain.modelsBucket | quote }}
+            - name: MODELS_POLL_S
+              value: {{ .Values.enrich.modelsPollSeconds | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.enrich.resources | nindent 12 }}

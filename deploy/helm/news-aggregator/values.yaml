@@ -1,0 +1,309 @@
+# Default values = pi-cluster posture (PLAN §2). values-dev.yaml overrides for k3d.
+
+images:
+  registry: ghcr.io/bnorton45/news_aggregator
+  tag: latest # fallback only — a digest pin below always wins (PLAN §3.4)
+  pullPolicy: IfNotPresent
+  # Per-component digest pins: CI's pin-digests job opens a PR updating these after
+  # every main build (empty = tag fallback, dev/bootstrap only).
+  # An empty pin means tag fallback until the image's first build lands a pin PR.
+  # NOTE: the pin-digests job rewrites these lines with a strict regex — no
+  # trailing comments on the key lines.
+  digests:
+    noaa: "sha256:3415ba6690b5fd2c851dcdc7358b31b410a4639a09e2dab633755c94a5fd9911"
+    gdacs: "sha256:772cc5b4a18d200758c06eb5ce01c0f7e644214d8b86f167bf5113738305099d"
+    wikipedia: "sha256:b95718915d11663ebb0739c1db5866c13ca1a78b1fa712428f8f84d6587118a9"
+    bluesky: "sha256:8c49d01624bc110ed59688fc5920efa366ecb4d011953c38919ed8aa8d7ef37c"
+    mastodon: "sha256:5c44b775a8e6bcd81324d8c1c8ffcae06730e972488464d00e3bb442ca2ea7c3"
+    gdelt: "sha256:2b6437f5907754d9a6fe9b1f5639bd9bea72b4ab772b3c3752c9d867cd537b37"
+    usgs: "sha256:667e8b3869b2261c3adf560899a94c4229c02eaebfd0ab6a517ea244ba9526ae"
+    state: "sha256:10f55c3d22069363a58ee270b180edf9cc4518a98faef8e3a7821f4f2b2c89c9"
+    dod: "sha256:b39fbe93a2a6b5fb26d18627814bc986427bd93e1449035e85019c33cc9c08ed"
+    cisa: "sha256:95c756c1ce9466fbe0ed62a026b875e601e1b7158680f1defd854b80671a175f"
+    cdc: "sha256:f0c723f00aa6f8d5dffae8122fe11ad0d341bde037bacd1cebc5db8408debe41"
+    enrich: "sha256:ad104b24481784dc1bc03fa8c2daadf28bac35d800a26733e343b8f0e24e1395"
+    writer: "sha256:6c4c244757fca74a2a96d0efb3300828f25fb957621a107a3d27f69ed7ac34aa"
+    cluster: "sha256:654a203533b9de64b9929fa4b9262f154a3e19c1b8f817e15f10ee6c9a32b65f"
+    trust: "sha256:bb9bad1979f694548f7ababe0be451f67e0bc1611b6ba9cfe123c31696971a88"
+    claimx: "sha256:60cf0528058f39a7f84b601183f4e229ce20bb0f29528a12891d9c22a3b63ea9"
+    score: "sha256:cecd1ee13c61bcdbd87b7cc709bfe1cba267e247f2872578e24ff38edfc944ac"
+    api: "sha256:c6fea5d954a84241ca95dc5b82a1a73680d97f2a268784ccd6781a90ef3b7bb2"
+    notify: "sha256:9e46449840936ca082d5521aab81f546c6619135d2c91f20582cfbdf1b2880bc"
+    retrain: "sha256:934298dd8e8a079054b28d155bd3f55a244731ee285a108e246d2bc98d3c23ec"
+  # Third-party images digest-pinned (tag kept for readability; the digest wins).
+  nats: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+  postgres: pgvector/pgvector:pg16@sha256:ad2e18408bf447f62092a8a5259e7df10505c5a0360bd1a1853ac8b8b0763da2
+  ntfy: binwiederhier/ntfy:v2.14.0@sha256:5a051798d14138c3ecb12c038652558ab6a077e1aceeb867c151cbf5fa8451ef
+  # Local LLM host (§6.3). Multi-arch digest (amd64+arm64) — re-pin at 0b if bumped.
+  ollama: ollama/ollama:0.31.2@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
+  # Observability (PLAN §2/§7). Multi-arch (amd64+arm64) digests.
+  prometheus: prom/prometheus:v2.53.5@sha256:7a34573f0b9c952286b33d537f233cd5b708e12263733aa646e50c33f598f16c
+  grafana: grafana/grafana:11.6.3@sha256:6128afd8174f01e39a78341cb457588f723bbb9c3b25c4d43c4b775881767069
+
+# Name of the SOPS-decrypted GHCR pull secret (deploy/secrets); empty = no pull secret
+# (dev: images imported into k3d directly). A reference, not a credential:
+imagePullSecret: ghcr-pull # pragma: allowlist secret
+
+# PLAN §2 workload placement: prefer role=state / role=compute nodes, soft affinity so
+# state can fail over (§2). Disabled on the single-node dev cluster.
+topology:
+  enabled: true
+
+# PriorityClasses (PLAN §2): state preempts an LLM replica when node-3 dies.
+priorityClasses:
+  enabled: true
+  state: 100000
+  pipeline: 10000
+  llm: 1000 # lowest: an Ollama replica is the first thing evicted when state fails over
+
+storage:
+  className: longhorn # dev: local-path
+  nats: 5Gi
+  postgres: 200Gi
+  ollama: 20Gi # per replica: Qwen3-4B (~3GB) + qwen3:1.7b (~1.4GB) + headroom
+
+# Observability (PLAN §2/§7): Prometheus + Grafana in zone-data on the state node. Netpol
+# (deploy/policies) already fences both. Prometheus is the one workload with a kube-API
+# token (service discovery); Grafana is LAN-only behind traefik. Disabled in dev overlays.
+monitoring:
+  enabled: true
+  prometheus:
+    retention: 7d # short horizon matches the 5-day data ethos (§4)
+    storage: 10Gi
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  grafana:
+    host: grafana.local # LAN DNS/hosts entry pointing at the cluster ingress
+    storage: 2Gi
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+
+postgres:
+  user: app
+  database: news
+  resources:
+    requests: { cpu: "1", memory: 4Gi }
+    limits: { cpu: "3", memory: 10Gi } # HNSW + buffers headroom (PLAN §2)
+
+nats:
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+
+# The 5-day wall (PLAN §4): daily partition provision + drop, via psql against the
+# in-zone Postgres. Runs as app user; schema functions are SECURITY-DEFINER-free.
+partitionCron:
+  schedule: "17 0 * * *" # daily, shortly after midnight UTC
+  retentionDays: 5
+
+usgs:
+  pollSeconds: 30
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+noaa:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 120
+  # api.weather.gov asks for an identifying UA; set an operator contact here or leave
+  # the generic in-code default.
+  userAgent: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+state:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 300
+  # www.state.gov's WAF 200-OK-blocks non-browser UAs; the in-code default is a
+  # Mozilla-compatible bot UA that self-identifies. Set an operator contact here.
+  userAgent: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# U.S. gov agency RSS feeds (share the services.ingest.press template). Same UA note as
+# state — the in-code default is a Mozilla-compatible bot UA; set an operator contact.
+dod:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 300
+  userAgent: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+cisa:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 300
+  userAgent: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+cdc:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 300
+  userAgent: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+gdacs:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  pollSeconds: 300
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+wikipedia:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  # SSE firehose covers every wiki — the allowlist + article-ns + human-edit shaping
+  # happens in the ingester before anything reaches NATS.
+  domains: [en.wikipedia.org]
+  skipMinor: false
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+bluesky:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  # WS firehose; language shaping happens in the ingester before anything reaches
+  # NATS. The §6.3a governor + JetStream buffer absorb the social-volume swings.
+  langs: [en]
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { cpu: "1", memory: 384Mi }
+
+mastodon:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  # Selected open instances (PLAN §6.1) — mastodon.social requires auth for the
+  # public timeline now, so it is not in the default set.
+  instances: [mstdn.social, mas.to, fosstodon.org]
+  langs: [en]
+  pollSeconds: 20
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+gdelt:
+  enabled: true # dev overlay disables: CI e2e stays single-source (llm.heavy assert)
+  # Mainstream-presence baseline (§6.6) — headlines/metadata only, never scraped.
+  # GDELT asks max 1 request / 5s; 120s is far under.
+  query: "sourcelang:english"
+  pollSeconds: 120
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+enrich:
+  replicas: 1
+  dedupBucket: dedup
+  modelsPollSeconds: 60 # §6.3 hot-swap: how often enrich checks the models KV
+  # Real int8 ONNX encoders (§6.3 step 3/4), baked into the enrich image at /opt/models
+  # (Dockerfile BAKE_MODELS=1). Empty ⇒ enrich falls back to hash/no-op stubs — the dev
+  # overlays blank these so k3d e2e keeps its stub vectors.
+  embedModelPath: /opt/models/bge-small
+  nerModelPath: /opt/models/ner
+  resources:
+    requests: { cpu: "1", memory: 1Gi } # classifier gets guaranteed CPU (PLAN §2)
+    limits: { cpu: "2", memory: 2Gi }
+
+# Local LLM host (PLAN §2 / §6.3): Ollama on the compute nodes. ZERO egress — weights are
+# pre-seeded onto each replica's PVC at bootstrap (docs/0b-bootstrap-runbook.md §10), never
+# pulled at runtime. Disabled in the dev overlays (no LLM in the e2e loop).
+ollama:
+  enabled: true
+  replicas: 2 # HA + burst; podAntiAffinity pins them one-per-compute-node (PLAN §2)
+  # The active model: claim extraction (the only wired LLM path) runs qwen3:1.7b — the 4B
+  # was rejected here because it reasons INTO content (docs/pi-throughput-findings.md).
+  models: ["qwen3:1.7b"]
+  # Design-retained for the future summarize/entity-res/brief tiers (§6.3), which have no
+  # service yet. Add "qwen3:4b" here + bump maxLoadedModels/memory when that tier lands.
+  extraModels: []
+  keepAlive: "-1" # keep the resident model warm so the claim path isn't hit by cold reloads
+  maxLoadedModels: 1 # just qwen3:1.7b today (~1.4GB); raise to 2 when the 4B tier is added
+  numParallel: 1
+  # Low request + high limit: Ollama bursts into idle headroom but YIELDS to the
+  # guaranteed-CPU firehose classifier under contention (PLAN §2 — "CPU is the discipline").
+  # Memory headroom sized for the 4B tier the Pi cluster will add at 0b (~3GB resident).
+  resources:
+    requests: { cpu: 250m, memory: 4Gi }
+    limits: { cpu: "3", memory: 6Gi }
+
+writer:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+# Claim-extraction worker (PLAN §6.3/§3.3): the Ollama client. role=inference, no DB.
+# Reaches the in-cluster Ollama ClusterIP service; runs qwen3:1.7b (never the 4B).
+claimx:
+  enabled: true
+  replicas: 1
+  ollamaUrl: http://ollama.zone-process.svc:11434
+  model: qwen3:1.7b
+  resources: # light itself — Ollama does the compute; this just brokers NATS <-> HTTP
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+cluster:
+  theta: "0.82"
+  windowDays: 2
+  topk: 10
+  corroborationN: 3 # §6.5: independent origins for CORROBORATED
+  corroborationSources: 2 # §6.5 source-diversity floor: distinct feeds/platforms (confirmed 2026-07-12)
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+trust:
+  enabled: true # dev overlay disables: e2e has no claimx/Ollama, so no claims flow
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+score:
+  enabled: true
+  gapThreshold: "2.0" # alert when gap exceeds this ∧ trust ≥ corroborated (§6.6)
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# Online filter-retrain loop (PLAN §6.3 step 2, §4): weak labels -> train -> eval gate
+# -> models KV; enrich hot-swaps. The eval gate (candidate F1 ≥ incumbent + data floors)
+# is the poisoning defense — see services/retrain/evalx.
+retrain:
+  enabled: true
+  modelsBucket: models
+  intervalSeconds: 21600 # 6h — the rolling 5-day window changes slowly (§4)
+  minRows: 200 # gate floor: total labeled rows required to train
+  minPerClass: 30 # gate floor: labeled rows required per class
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi } # feature-hashing + numpy LR over the window
+
+api:
+  enabled: true
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# Self-hosted push (PLAN §6.8): LAN-only ntfy behind traefik, host-routed.
+# read-only default access — any LAN device subscribes to the topic with zero
+# setup; only the notify pod's provisioned `publisher` user can write.
+ntfy:
+  enabled: true
+  host: ntfy.local # LAN DNS/hosts entry pointing at the cluster ingress
+  topic: alerts
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+notify:
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+logLevel: INFO

@@ -1,0 +1,314 @@
+# Multi-node scheduling validation (PLAN §2): runs in CI. The single-node k3d-e2e.yml
+# stays the fast pipeline-logic gate; this workflow proves the parts of the 3-node
+# Pi topology that don't need real hardware:
+#   placement (soft role-affinity puts state pods on the state node, workers on
+#   compute nodes), PriorityClass preemption (na-state evicts low-priority filler
+#   on a saturated node), and compute-node failover (drain the node hosting enrich
+#   -> stateless workers reschedule to the other compute node, pipeline keeps flowing).
+#
+# RESIDUAL HARDWARE-GATED ITEM (deliberately NOT tested here): state-node failover /
+# Postgres cold reschedule needs replicated storage (Longhorn on NVMe). Longhorn-in-k3d
+# is a known tarpit (nodes are containers; iscsi attach is flaky) and k3d's local-path
+# PVCs are node-bound, so that half waits for the Pis.
+name: k3d-multinode-e2e
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/k3d-multinode-e2e.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3d-multinode-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free runner disk (3 nodes each hold a copy of every image)
+        run: |
+          # A single-node cluster fits, but importing the app images into three
+          # k3d node containers tripped kubelet DiskPressure/ImageGC on the stock
+          # runner (92% of 71.6GiB). Drop the big preinstalled toolchains first.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+
+      - name: Install k3d + flux
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          curl -s https://fluxcd.io/install.sh | sudo bash
+
+      - name: Create 3-node cluster and label roles (PLAN §2 topology)
+        run: |
+          k3d cluster create e2e --agents 2 --wait --timeout 180s
+          # Node label `role` is what na.nodeAffinity matches on (weight-90 soft
+          # preference). Label BEFORE any workload lands.
+          kubectl label node k3d-e2e-server-0 role=state
+          kubectl label node k3d-e2e-agent-0 role=compute
+          kubectl label node k3d-e2e-agent-1 role=compute
+          kubectl get nodes --show-labels
+
+      - name: Build and import images (dev names, single-arch)
+        run: |
+          docker build --build-arg EXTRA=ingest -t news_aggregator/usgs:local .
+          docker build --build-arg EXTRA=enrich -t news_aggregator/enrich:local .
+          docker build --build-arg EXTRA=retrain -t news_aggregator/retrain:local .
+          docker build --build-arg EXTRA=api -t news_aggregator/api:local .
+          docker tag news_aggregator/enrich:local news_aggregator/writer:local
+          docker tag news_aggregator/enrich:local news_aggregator/cluster:local
+          docker tag news_aggregator/enrich:local news_aggregator/score:local
+          docker tag news_aggregator/api:local news_aggregator/notify:local
+          k3d image import -c e2e news_aggregator/{usgs,enrich,retrain,writer,cluster,score,api,notify}:local
+          docker pull -q nats:2.10-alpine && docker pull -q pgvector/pgvector:pg16
+          docker pull -q binwiederhier/ntfy:v2.14.0 && docker pull -q busybox:1.36
+          k3d image import -c e2e nats:2.10-alpine pgvector/pgvector:pg16 \
+            binwiederhier/ntfy:v2.14.0 busybox:1.36
+          # The cluster's containerd now holds the copies — reclaim the host-side
+          # images and build cache before kubelet notices the disk (see step 1).
+          docker image rm news_aggregator/{usgs,enrich,retrain,writer,cluster,score,api,notify}:local \
+            nats:2.10-alpine pgvector/pgvector:pg16 binwiederhier/ntfy:v2.14.0 busybox:1.36 >/dev/null
+          docker builder prune -af >/dev/null
+          df -h /
+
+      - name: Flux install + GitRepository pinned to this sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          flux install
+          printf '%s' "$GH_TOKEN" > /tmp/gitpw
+          kubectl -n flux-system create secret generic flux-git \
+            --from-literal=username=x-access-token --from-file=password=/tmp/gitpw
+          rm /tmp/gitpw
+          flux create source git flux-system \
+            --url="https://github.com/${{ github.repository }}" \
+            --commit="$SHA" --secret-ref=flux-git
+          # The single-node e2e patches the HelmRelease AFTER the apps kustomization
+          # creates it — a race it usually wins. Here install #1 started with the
+          # prod defaults before the patch landed once: longhorn PVCs were created,
+          # survive the remediation uninstall (STS PVCs always do), and pin
+          # postgres/nats Pending forever. Kill the race instead of re-running it:
+          # give the apps Kustomization a patch so the HR is BORN with the 3-file
+          # valuesFiles list (append is safe — `patches` is a spec-level key and
+          # apps.yaml is a single document).
+          cp deploy/flux/apps.yaml /tmp/apps-multinode.yaml
+          cat >> /tmp/apps-multinode.yaml <<'EOF'
+            patches:
+              - target:
+                  kind: HelmRelease
+                  name: news-aggregator
+                patch: |
+                  - op: add
+                    path: /spec/chart/spec/valuesFiles
+                    value:
+                      - deploy/helm/news-aggregator/values.yaml
+                      - deploy/helm/news-aggregator/values-dev.yaml
+                      - deploy/helm/news-aggregator/values-dev-multinode.yaml
+          EOF
+          kubectl apply -f deploy/flux/policies.yaml -f /tmp/apps-multinode.yaml -f deploy/flux/secrets-sync.yaml
+          kubectl wait --for=condition=Ready --timeout=180s \
+            kustomization/policies -n flux-system
+
+      - name: Wait for the HelmRelease (born with the multinode overlay)
+        run: |
+          for i in $(seq 1 24); do
+            kubectl get helmrelease news-aggregator -n flux-system >/dev/null 2>&1 && break
+            echo "waiting for apps kustomization to create the HelmRelease ($i)"; sleep 5
+          done
+          kubectl get helmrelease news-aggregator -n flux-system \
+            -o jsonpath='{.spec.chart.spec.valuesFiles}' | grep -q values-dev-multinode.yaml \
+            || { echo "FAIL: HelmRelease missing the multinode valuesFiles patch"; exit 1; }
+          kubectl wait --for=condition=Ready --timeout=300s \
+            helmrelease/news-aggregator -n flux-system
+
+      - name: Wait for workloads
+        run: |
+          kubectl rollout status -n zone-data statefulset/nats --timeout=180s
+          kubectl rollout status -n zone-data statefulset/postgres --timeout=180s
+          kubectl rollout status -n zone-ingest deployment/ingest-usgs --timeout=180s
+          kubectl rollout status -n zone-process deployment/enrich --timeout=180s
+          kubectl rollout status -n zone-process deployment/writer --timeout=180s
+          kubectl rollout status -n zone-process deployment/cluster --timeout=180s
+          kubectl rollout status -n zone-process deployment/score --timeout=180s
+          kubectl rollout status -n zone-process deployment/retrain --timeout=180s
+          kubectl rollout status -n zone-present deployment/api --timeout=180s
+          kubectl rollout status -n zone-present deployment/notify --timeout=180s
+          kubectl rollout status -n zone-present deployment/ntfy --timeout=180s
+          kubectl get pods -A -o wide
+
+      - name: "ASSERT: role placement (soft affinity puts pods on their node)"
+        run: |
+          # weight-90 preferred affinity, not required: with fresh empty nodes and
+          # dev-sized requests it should always place right. If this ever flakes
+          # under capacity pressure, loosen to "state pods not on a compute node"
+          # — do NOT make the chart affinity `required` (product behavior change).
+          # jsonpath, NOT `-o wide` columns: a recent restart renders RESTARTS as
+          # "2 (33s ago)" which shifts the NODE column and breaks awk-by-field.
+          node_of() {
+            kubectl get pods -n "$1" -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' \
+              | awk -v p="^$2" '$1 ~ p {print $2; exit}'
+          }
+          fail=0
+          for spec in zone-data:postgres zone-data:nats zone-process:writer zone-process:cluster zone-process:score; do
+            ns=${spec%%:*}; app=${spec##*:}
+            n=$(node_of "$ns" "$app")
+            echo "state   $ns/$app -> $n"
+            [ "$n" = "k3d-e2e-server-0" ] || { echo "FAIL: $app expected on the state node"; fail=1; }
+          done
+          for spec in zone-ingest:ingest-usgs zone-process:enrich zone-process:retrain zone-present:api zone-present:notify zone-present:ntfy; do
+            ns=${spec%%:*}; app=${spec##*:}
+            n=$(node_of "$ns" "$app")
+            echo "compute $ns/$app -> $n"
+            case "$n" in
+              k3d-e2e-agent-*) ;;
+              *) echo "FAIL: $app expected on a compute node"; fail=1 ;;
+            esac
+          done
+          exit $fail
+
+      - name: "ASSERT: PriorityClasses exist and pods carry them"
+        run: |
+          S=$(kubectl get priorityclass na-state -o jsonpath='{.value}')
+          P=$(kubectl get priorityclass na-pipeline -o jsonpath='{.value}')
+          echo "na-state=$S na-pipeline=$P"
+          [ "$S" = "100000" ] && [ "$P" = "10000" ]
+          PG=$(kubectl get pod -n zone-data postgres-0 -o jsonpath='{.spec.priorityClassName}')
+          echo "postgres priorityClassName=$PG"; [ "$PG" = "na-state" ]
+          EN=$(kubectl get pods -n zone-process --no-headers | awk '/^enrich/{print $1; exit}')
+          EP=$(kubectl get pod -n zone-process "$EN" -o jsonpath='{.spec.priorityClassName}')
+          echo "enrich priorityClassName=$EP"; [ "$EP" = "na-pipeline" ]
+
+      - name: "ASSERT: na-state preempts low-priority filler on a saturated node"
+        run: |
+          # PLAN §2: on state-node loss, state pods must be able to evict lower-
+          # priority workloads instead of staying Pending. Synthetic version: fill
+          # one compute node's remaining CPU with a priority-0 pod, then schedule a
+          # na-state probe pinned to the same node — the scheduler must preempt.
+          NODE=k3d-e2e-agent-1
+          alloc=$(kubectl get node "$NODE" -o jsonpath='{.status.allocatable.cpu}')
+          case "$alloc" in *m) alloc_m=${alloc%m};; *) alloc_m=$((alloc*1000));; esac
+          raw=$(kubectl describe node "$NODE" | awk '/Allocated resources:/,0' | awk '$1=="cpu"{print $2; exit}')
+          case "$raw" in *m) used_m=${raw%m};; *) used_m=$((raw*1000));; esac
+          filler_m=$((alloc_m - used_m - 100))
+          echo "node=$NODE allocatable=${alloc_m}m requested=${used_m}m filler=${filler_m}m"
+          [ "$filler_m" -gt 300 ] || { echo "FAIL: node too full to stage the test"; exit 1; }
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: filler, namespace: default}
+          spec:
+            nodeSelector: {kubernetes.io/hostname: $NODE}
+            terminationGracePeriodSeconds: 1
+            containers:
+              - name: filler
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                resources: {requests: {cpu: ${filler_m}m}}
+          EOF
+          kubectl wait --for=condition=Ready pod/filler --timeout=120s
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: preempt-probe, namespace: default}
+          spec:
+            nodeSelector: {kubernetes.io/hostname: $NODE}
+            priorityClassName: na-state
+            terminationGracePeriodSeconds: 1
+            containers:
+              - name: probe
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                resources: {requests: {cpu: 300m}}
+          EOF
+          kubectl wait --for=condition=Ready pod/preempt-probe --timeout=180s
+          echo "preempt-probe is Running (na-state scheduled onto the full node)"
+          if kubectl get pod filler >/dev/null 2>&1; then
+            PH=$(kubectl get pod filler -o jsonpath='{.status.phase}')
+            [ "$PH" != "Running" ] || { echo "FAIL: filler still Running — no preemption happened"; exit 1; }
+          fi
+          echo "filler was preempted (correct)"
+          kubectl get events -n default --field-selector reason=Preempted || true
+          # restore capacity for the failover assert below
+          kubectl delete pod preempt-probe filler --ignore-not-found --wait=true
+
+      - name: "ASSERT: compute-node failover — drain enrich's node, pipeline keeps flowing"
+        run: |
+          # The §2 promise this covers: lose a compute node and ingest+enrich+persist
+          # stay up. Drain whichever agent hosts enrich so the inference worker is
+          # forced to move; state pods on server-0 are untouched.
+          DRAIN=$(kubectl get pods -n zone-process -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' \
+            | awk '/^enrich/{print $2; exit}')
+          echo "enrich is on $DRAIN"
+          case "$DRAIN" in k3d-e2e-agent-*) ;; *) echo "FAIL: enrich not on a compute node"; exit 1;; esac
+          BEFORE=$(kubectl exec -n zone-data statefulset/postgres -- \
+            psql -U app -d news -tAc "SELECT count(*) FROM items;")
+          echo "items before drain: $BEFORE"
+          kubectl drain "$DRAIN" --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
+          kubectl rollout status -n zone-process deployment/enrich --timeout=300s
+          kubectl rollout status -n zone-process deployment/retrain --timeout=300s
+          kubectl rollout status -n zone-ingest deployment/ingest-usgs --timeout=300s
+          kubectl rollout status -n zone-present deployment/api --timeout=300s
+          kubectl rollout status -n zone-present deployment/notify --timeout=300s
+          kubectl rollout status -n zone-present deployment/ntfy --timeout=300s
+          NOW=$(kubectl get pods -n zone-process -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' \
+            | awk '/^enrich/{print $2; exit}')
+          echo "enrich rescheduled to $NOW"
+          [ "$NOW" != "$DRAIN" ] || { echo "FAIL: enrich still on the drained node"; exit 1; }
+          case "$NOW" in k3d-e2e-agent-*) ;; *) echo "FAIL: enrich fell off the compute pool"; exit 1;; esac
+          kubectl get pods -A -o wide
+          # Prove flow THROUGH the rescheduled workers, deterministically: the live
+          # USGS feed dedups, so inject one synthetic item via the ingester's own
+          # scoped publisher (its creds, its subject — same pattern as the single-node
+          # e2e tally probe) and require the items count to climb past the pre-drain mark.
+          kubectl exec -n zone-ingest deploy/ingest-usgs -- python -c '
+          import asyncio
+          from libs.bus import BusConfig, ScopedPublisher, connect
+          from libs.schema import Item, SourceClass
+          async def main():
+              cfg = BusConfig.from_env()
+              nc, js = await connect(cfg)
+              pub = ScopedPublisher(js, "ingest.usgs", cfg.max_msg_bytes)
+              item = Item(source="usgs", source_class=SourceClass.AUTHORITATIVE,
+                          text="M 4.2 - e2e failover probe synthetic tremor (post-drain)")
+              await pub.publish("ingest.usgs", item)
+              await nc.drain()
+          asyncio.run(main())'
+          for i in $(seq 1 18); do
+            N=$(kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -tAc "SELECT count(*) FROM items;" || echo 0)
+            echo "items=$N (was $BEFORE, try $i)"
+            [ "${N:-0}" -gt "${BEFORE:-0}" ] && break
+            sleep 10
+          done
+          [ "${N:-0}" -gt "${BEFORE:-0}" ] || {
+            kubectl logs -n zone-ingest deploy/ingest-usgs --tail=50
+            kubectl logs -n zone-process deploy/enrich --tail=50
+            kubectl logs -n zone-process deploy/writer --tail=50
+            exit 1
+          }
+          echo "pipeline still flowing through the rescheduled workers (correct)"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -40 || true
+          flux get all -A || true
+          kubectl logs -n zone-process deploy/enrich --tail=40 || true
+          kubectl logs -n zone-data statefulset/nats --tail=40 || true
+          kubectl get pods -A --no-headers | awk '$3 != "Running" || $2 !~ /^([0-9]+)\/\1$/ {print $1, $2}' \
+          | while read -r ns pod; do
+              echo "=== describe $ns/$pod ==="; kubectl describe pod -n "$ns" "$pod" | tail -25 || true
+              echo "=== logs $ns/$pod ==="; kubectl logs -n "$ns" "$pod" --tail=40 || true
+              echo "=== previous logs $ns/$pod ==="; kubectl logs -n "$ns" "$pod" --previous --tail=40 || true
+            done

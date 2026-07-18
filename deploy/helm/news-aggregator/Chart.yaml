@@ -1,0 +1,9 @@
+apiVersion: v2
+name: news-aggregator
+description: >-
+  OSINT developing-story aggregator — application workloads for the 4 trust zones
+  (PLAN §3.1). Namespaces/PSS/NetworkPolicies/RBAC live in deploy/policies and are
+  applied by Flux BEFORE this chart so pods land inside the fences.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

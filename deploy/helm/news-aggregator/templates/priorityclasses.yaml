@@ -1,0 +1,24 @@
+{{- if .Values.priorityClasses.enabled }}
+# PLAN §2: on node-3 loss, state (Postgres/NATS) preempts lower-priority pods on a
+# compute node (a low-priority na-llm Ollama replica) instead of staying Pending.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: na-state
+value: {{ .Values.priorityClasses.state }}
+description: Stateful core (Postgres, NATS) — preempts pipeline/LLM workloads.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: na-pipeline
+value: {{ .Values.priorityClasses.pipeline }}
+description: Pipeline workers — above best-effort, below state.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: na-llm
+value: {{ .Values.priorityClasses.llm }}
+description: Ollama LLM replicas — lowest; preempted by state on node-3 loss (PLAN §2).
+{{- end }}

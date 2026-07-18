@@ -1,0 +1,51 @@
+# db-writer (PLAN §3.3): the ONLY zone-process pod with a DB credential; consumes the
+# already-validated enriched.* seam. role=db-writer opens its 5432 route in the netpol.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+  namespace: zone-process
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer
+  template:
+    metadata:
+      labels:
+        app: writer
+        role: db-writer
+    spec:
+      serviceAccountName: db-writer
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: writer
+          image: {{ include "na.image" (list "writer" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.writer.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-writer
+                  key: password
+            - name: NATS_URL
+              value: "nats://writer:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+            - name: POSTGRES_DSN
+              value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres.zone-data.svc:5432/{{ .Values.postgres.database }}"
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.writer.resources | nindent 12 }}

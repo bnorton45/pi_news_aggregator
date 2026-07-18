@@ -1,0 +1,104 @@
+# Dev overlay: k3d in CI (the k8s-fidelity parity target).
+# Local images imported via `k3d image import`, default storage class, no placement
+# preferences, tiny resources. The multi-node e2e layers values-dev-multinode.yaml on
+# top of this to turn topology + priorityClasses back ON without touching the rest.
+
+images:
+  registry: news_aggregator # docker compose build names, imported into k3d
+  tag: local
+  # Helm deep-merges maps, so production digest pins from values.yaml would survive
+  # here and beat the :local tag in na.image — blank them out for the imported images.
+  digests:
+    noaa: ""
+    gdacs: ""
+    wikipedia: ""
+    bluesky: ""
+    mastodon: ""
+    gdelt: ""
+    usgs: ""
+    state: ""
+    dod: ""
+    cisa: ""
+    cdc: ""
+    enrich: ""
+    writer: ""
+    cluster: ""
+    trust: ""
+    score: ""
+    api: ""
+    notify: ""
+    retrain: ""
+
+imagePullSecret: "" # no GHCR pull in dev
+
+# CI e2e is deliberately single-source (its llm.heavy-stays-closed assert relies on
+# origins=1) — extra ingesters stay off in dev.
+noaa:
+  enabled: false
+gdacs:
+  enabled: false
+wikipedia:
+  enabled: false
+bluesky:
+  enabled: false
+mastodon:
+  enabled: false
+gdelt:
+  enabled: false
+state:
+  enabled: false
+dod:
+  enabled: false
+cisa:
+  enabled: false
+cdc:
+  enabled: false
+
+# No claimx/Ollama in the e2e loop -> no claims to match; keep the pod count down.
+trust:
+  enabled: false
+ollama:
+  enabled: false # no LLM host on k3d (no pre-seeded weights; e2e asserts llm.heavy stays closed)
+claimx:
+  enabled: false # no Ollama to talk to; the claim path stays dormant in the e2e loop
+monitoring:
+  enabled: false # no Prometheus/Grafana in the e2e loop (kube-SD + PVCs add nothing to assert)
+
+topology:
+  enabled: false
+
+priorityClasses:
+  enabled: false
+
+storage:
+  className: local-path
+  nats: 1Gi
+  postgres: 5Gi
+
+postgres:
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+nats:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+enrich:
+  modelsPollSeconds: 10 # e2e: pick up the promoted model fast
+  # k3d images aren't baked with encoders (and e2e asserts on stub vectors) → run stubs.
+  embedModelPath: ""
+  nerModelPath: ""
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+# e2e: retrain every 30s over tiny seeded label floors so the loop completes in-run.
+retrain:
+  intervalSeconds: 30
+  minRows: 4
+  minPerClass: 2
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }

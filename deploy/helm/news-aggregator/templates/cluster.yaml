@@ -1,0 +1,61 @@
+# Cluster service (PLAN §6.4): structured-data pod (ANN + Story SQL), DB-RW like the
+# writer — role=cluster opens its 5432 route; publishes the gated llm.heavy queue.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster
+  namespace: zone-process
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster
+  template:
+    metadata:
+      labels:
+        app: cluster
+        role: cluster
+    spec:
+      serviceAccountName: cluster
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: cluster
+          image: {{ include "na.image" (list "cluster" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.cluster.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-cluster
+                  key: password
+            - name: NATS_URL
+              value: "nats://cluster:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+            - name: POSTGRES_DSN
+              value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres.zone-data.svc:5432/{{ .Values.postgres.database }}"
+            - name: CLUSTER_THETA
+              value: {{ .Values.cluster.theta | quote }}
+            - name: CLUSTER_WINDOW_DAYS
+              value: {{ .Values.cluster.windowDays | quote }}
+            - name: CLUSTER_TOPK
+              value: {{ .Values.cluster.topk | quote }}
+            - name: CORROBORATION_N
+              value: {{ .Values.cluster.corroborationN | quote }}
+            - name: CORROBORATION_SOURCES
+              value: {{ .Values.cluster.corroborationSources | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.cluster.resources | nindent 12 }}

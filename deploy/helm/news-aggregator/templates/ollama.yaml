@@ -1,0 +1,120 @@
+{{- if .Values.ollama.enabled }}
+# Local LLM host (PLAN §2 workload placement, §6.3 tiering): Ollama on the compute nodes.
+# The one wired client today is claimx → qwen3:1.7b for the extractive claim task; the 4B
+# was rejected there because it reasons INTO content and emits 40-280s of garbage/claim
+# (docs/pi-throughput-findings.md). A larger model (Qwen3-4B) is design-RETAINED only for the
+# future generative tiers — summarize / entity-resolution / thinking brief — which have no
+# service yet, so it is opt-in via ollama.extraModels. Clients reach the host at ollama:11434.
+#
+# SECURITY (PLAN §3.1/§3.3): zone-process, default-deny. The `app: ollama` netpol is
+# INGRESS-ONLY (accepts 11434 from role=inference) and grants NO egress — Ollama reaches
+# nothing. Model weights are therefore NEVER pulled at runtime: they are pre-seeded onto
+# each replica's Longhorn PVC during bootstrap (docs/0b-bootstrap-runbook.md §10). This
+# preserves the zero-egress invariant; do not add an egress rule without sign-off.
+#
+# Headless service backs the StatefulSet's stable DNS; the ClusterIP service is what
+# clients dial (load-balanced across ready replicas).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-headless
+  namespace: zone-process
+spec:
+  clusterIP: None
+  selector:
+    app: ollama
+  ports:
+    - { name: http, port: 11434, targetPort: 11434 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: zone-process
+spec:
+  selector:
+    app: ollama
+  ports:
+    - { name: http, port: 11434, targetPort: 11434 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: zone-process
+spec:
+  serviceName: ollama-headless
+  replicas: {{ .Values.ollama.replicas }}
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama # netpol/RBAC key (deploy/policies); NOT role=inference (it's the server)
+    spec:
+      serviceAccountName: ollama
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-llm # lowest — state preempts a replica on node-3 loss (§2)
+      {{- end }}
+      # Pin the replicas one-per-node (HA + burst) and prefer compute nodes (§2). Inlined
+      # rather than via na.nodeAffinity because this workload also needs podAntiAffinity.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: ollama }
+              topologyKey: kubernetes.io/hostname
+        {{- if .Values.topology.enabled }}
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 90
+              preference:
+                matchExpressions:
+                  - { key: role, operator: In, values: [compute] }
+        {{- end }}
+      {{- include "na.podSecurity" 10002 | nindent 6 }}
+      containers:
+        - name: ollama
+          image: {{ .Values.images.ollama | quote }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 11434, name: http }
+          env:
+            - { name: OLLAMA_HOST, value: "0.0.0.0:11434" }
+            # keep_alive -1: 4B stays resident so the user-facing brief isn't hit by a cold
+            # reload; a preempted replica is scaled to 0, freeing the RAM (PLAN §2).
+            - { name: OLLAMA_KEEP_ALIVE, value: {{ .Values.ollama.keepAlive | quote }} }
+            - { name: OLLAMA_MAX_LOADED_MODELS, value: {{ .Values.ollama.maxLoadedModels | quote }} }
+            - { name: OLLAMA_NUM_PARALLEL, value: {{ .Values.ollama.numParallel | quote }} }
+            # HOME + model dir on the writable PVC — the image runs nonroot under a
+            # read-only rootfs, so nothing may write to /root.
+            - { name: HOME, value: /models }
+            - { name: OLLAMA_MODELS, value: /models/models }
+          resources: {{- toYaml .Values.ollama.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /, port: 11434 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 11434 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: models # pre-seeded at bootstrap (runbook §10); persists across restarts
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.ollama }}
+{{- end }}

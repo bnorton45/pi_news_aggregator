@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>news-aggregator — developing stories</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Developing stories</h1>
+    <div id="banners" role="status"></div>
+  </header>
+  <main>
+    <section id="feed-section">
+      <div class="tabs" role="tablist">
+        <button id="tab-gap" class="tab active" role="tab" aria-selected="true">Gap-ranked</button>
+        <button id="tab-corroborated" class="tab" role="tab" aria-selected="false">Corroborated</button>
+        <button id="tab-primary" class="tab" role="tab" aria-selected="false">Primary-backed</button>
+        <button id="tab-weather" class="tab" role="tab" aria-selected="false">Weather</button>
+      </div>
+      <h2 id="feed-heading">Ranked by gap score <span class="hint">velocity × (1−mainstream) × corroboration × (1−inauthenticity)</span></h2>
+      <div id="feed" aria-live="polite"></div>
+    </section>
+    <aside id="alerts-section">
+      <h2>Alerts</h2>
+      <div id="alerts"></div>
+      <h2>System</h2>
+      <div id="system"></div>
+    </aside>
+  </main>
+  <footer>data ages out at the 5-day wall · refreshed <span id="refreshed">–</span></footer>
+  <script src="app.js"></script>
+</body>
+</html>

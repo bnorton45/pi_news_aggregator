@@ -1,0 +1,30 @@
+# The application chart, rendered in-cluster by helm-controller (which is what makes
+# the chart's lookup-based generate-or-preserve secrets work, PLAN §3.5).
+# Default values = pi-cluster (no valuesFiles here). The CI e2es point it at the dev
+# overlays: k3d-e2e.yml patches this HR in-cluster after the apps Kustomization
+# creates it (a race it usually wins); k3d-multinode-e2e.yml instead injects
+# spec.patches into the apps Kustomization pre-apply so the HR is BORN with its
+# valuesFiles — if install #1 ever runs with these prod defaults, the longhorn PVCs
+# it creates survive remediation and pin postgres/nats Pending (see debug-loop doc).
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: news-aggregator
+  namespace: flux-system
+spec:
+  interval: 10m
+  targetNamespace: zone-data # release bookkeeping; resources set explicit namespaces
+  storageNamespace: zone-data
+  chart:
+    spec:
+      chart: ./deploy/helm/news-aggregator
+      sourceRef:
+        kind: GitRepository
+        name: flux-system
+      reconcileStrategy: Revision
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3

@@ -1,0 +1,49 @@
+{{- if .Values.score.enabled }}
+# Score worker (PLAN §6.6/§6.8): gap scoring + alerts off the firehose tallies.
+# Structured-data pod like the writer (parameterized SQL, no model over raw text —
+# §3.3); role=score opens its 5432 route in the netpol. DB-only: no NATS at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: score
+  namespace: zone-process
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: score
+  template:
+    metadata:
+      labels:
+        app: score
+        role: score
+    spec:
+      serviceAccountName: score
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: score
+          image: {{ include "na.image" (list "score" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.score.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+            - name: POSTGRES_DSN
+              value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@postgres.zone-data.svc:5432/{{ .Values.postgres.database }}"
+            - name: GAP_ALERT_THRESHOLD
+              value: {{ .Values.score.gapThreshold | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.score.resources | nindent 12 }}
+{{- end }}

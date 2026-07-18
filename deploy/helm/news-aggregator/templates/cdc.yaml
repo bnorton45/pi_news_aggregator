@@ -1,0 +1,54 @@
+{{- if .Values.cdc.enabled }}
+# CDC newsroom ingester (zone-ingest DMZ): parses internet data
+# => least power (PLAN §3.1). role=ingester matches the netpol allowing ONLY
+# upstream-443 + NATS publish. Disabled in values-dev: the CI e2e stays single-source
+# (its llm.heavy gate assert depends on origins=1), and each source keeps its own switch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-cdc
+  namespace: zone-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cdc
+  template:
+    metadata:
+      labels:
+        app: cdc
+        role: ingester
+    spec:
+      serviceAccountName: ingest-cdc
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: cdc
+          image: {{ include "na.image" (list "cdc" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.ingest.cdc.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-cdc
+                  key: password
+            - name: NATS_URL
+              value: "nats://state:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: CDC_POLL_SECONDS
+              value: {{ .Values.cdc.pollSeconds | quote }}
+            {{- if .Values.cdc.userAgent }}
+            - name: CDC_USER_AGENT
+              value: {{ .Values.cdc.userAgent | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.cdc.resources | nindent 12 }}
+{{- end }}

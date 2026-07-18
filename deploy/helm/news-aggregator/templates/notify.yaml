@@ -1,0 +1,57 @@
+{{- if .Values.ntfy.enabled }}
+# Alert push notifier (PLAN §6.8): polls the alerts table on the READ-ONLY
+# api_ro role and POSTs to the in-cluster ntfy server as `publisher`. role=notify
+# opens exactly Postgres:5432 + ntfy:8080 in the netpols — no other egress.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notify
+  namespace: zone-present
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notify
+  template:
+    metadata:
+      labels:
+        app: notify
+        role: notify
+    spec:
+      serviceAccountName: notify
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: notify
+          image: {{ include "na.image" (list "notify" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.notify.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-api
+                  key: password
+            - name: POSTGRES_DSN
+              value: "postgresql://api_ro:$(POSTGRES_PASSWORD)@postgres.zone-data.svc:5432/{{ .Values.postgres.database }}"
+            - name: NTFY_URL
+              value: "http://ntfy.zone-present.svc:8080"
+            - name: NTFY_TOPIC
+              value: {{ .Values.ntfy.topic | quote }}
+            - name: NTFY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ntfy-pub
+                  key: password
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.notify.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,148 @@
+# zone-present (PLAN §3.1): the only zone a user reaches, via the k3s ingress
+# controller. The API holds a READ-ONLY Postgres role (enforced at the DB grant;
+# the NetworkPolicy can only scope the route). No other egress, no internet.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: zone-present
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: zone-present
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+  namespace: zone-present
+spec:
+  podSelector:
+    matchLabels:
+      role: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-db-readonly
+  namespace: zone-present
+spec:
+  podSelector:
+    matchLabels:
+      role: api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              zone: data
+          podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+# notify (PLAN §6.8): the alert push worker. Reads alerts on the api_ro role and
+# POSTs to the in-cluster ntfy server — exactly those two routes, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-egress
+  namespace: zone-present
+spec:
+  podSelector:
+    matchLabels:
+      role: notify
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              zone: data
+          podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ntfy
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# ntfy server: subscribers arrive through traefik (LAN), publishes only from the
+# notify pod. No egress at all — a self-hosted push server phones nobody home.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ntfy-ingress
+  namespace: zone-present
+spec:
+  podSelector:
+    matchLabels:
+      role: ntfy
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+        - podSelector:
+            matchLabels:
+              role: notify
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-scrape
+  namespace: zone-present
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zone: data
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - { protocol: TCP, port: metrics }

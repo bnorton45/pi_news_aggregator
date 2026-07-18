@@ -1,0 +1,376 @@
+# k3d validation (PLAN §10): the k8s-fidelity check runs in CI, on a disposable
+# rootful runner, as a regression gate.
+#
+# Flow is PURE GitOps, same as the Pi bootstrap: flux install -> GitRepository pinned
+# to this exact sha -> policies/apps Kustomizations -> HelmRelease (patched onto the
+# dev values for the single-node runner). Then it proves what compose can't:
+#   PSS admission, default-deny NetworkPolicy enforcement, per-user NATS auth in k8s,
+#   the whole USGS->enrich->writer->cluster path under those fences, and in-cluster
+#   SOPS/age decryption (via a throwaway key + OCI artifact — no secret enters git).
+#
+# This stays the FAST single-node pipeline-logic gate. The multi-node topology
+# asserts (role placement, PriorityClass preemption, compute-node drain-failover)
+# live in k3d-multinode-e2e.yml, which triggers on deploy/** paths only.
+name: k3d-e2e
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "libs/**"
+      - "services/**"
+      - ".github/workflows/k3d-e2e.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3d-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install k3d, flux, sops, age
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          curl -s https://fluxcd.io/install.sh | sudo bash
+          sudo curl -sL -o /usr/local/bin/sops \
+            https://github.com/getsops/sops/releases/download/v3.9.2/sops-v3.9.2.linux.amd64
+          sudo chmod +x /usr/local/bin/sops
+          curl -sL https://github.com/FiloSottile/age/releases/download/v1.2.0/age-v1.2.0-linux-amd64.tar.gz \
+            | tar xz && sudo mv age/age age/age-keygen /usr/local/bin/
+
+      - name: Create cluster (+ local OCI registry for the SOPS test)
+        run: |
+          k3d cluster create e2e --registry-create e2e-reg:0.0.0.0:5001 --wait --timeout 180s
+          kubectl get nodes
+
+      - name: Build and import images (dev names, single-arch)
+        run: |
+          docker build --build-arg EXTRA=ingest -t news_aggregator/usgs:local .
+          docker build --build-arg EXTRA=enrich -t news_aggregator/enrich:local .
+          docker build --build-arg EXTRA=retrain -t news_aggregator/retrain:local .
+          docker build --build-arg EXTRA=api -t news_aggregator/api:local .
+          docker tag news_aggregator/enrich:local news_aggregator/writer:local
+          docker tag news_aggregator/enrich:local news_aggregator/cluster:local
+          docker tag news_aggregator/enrich:local news_aggregator/score:local
+          docker tag news_aggregator/api:local news_aggregator/notify:local
+          k3d image import -c e2e news_aggregator/{usgs,enrich,retrain,writer,cluster,score,api,notify}:local
+          docker pull -q nats:2.10-alpine && docker pull -q pgvector/pgvector:pg16
+          docker pull -q binwiederhier/ntfy:v2.14.0
+          k3d image import -c e2e nats:2.10-alpine pgvector/pgvector:pg16 binwiederhier/ntfy:v2.14.0
+
+      - name: Flux install + GitRepository pinned to this sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          flux install
+          printf '%s' "$GH_TOKEN" > /tmp/gitpw
+          kubectl -n flux-system create secret generic flux-git \
+            --from-literal=username=x-access-token --from-file=password=/tmp/gitpw
+          rm /tmp/gitpw
+          flux create source git flux-system \
+            --url="https://github.com/${{ github.repository }}" \
+            --commit="$SHA" --secret-ref=flux-git
+          # Make the HelmRelease BORN with the dev valuesFiles so helm-controller never
+          # starts install #1 with prod defaults — those create longhorn PVCs that survive
+          # the remediation uninstall and pin postgres/nats Pending (the HR-patch race that
+          # bit the multinode e2e 2026-07-07). Kill the race instead of running it: append a
+          # spec-level `patches` (JSON6902 add of valuesFiles) to the apps Kustomization
+          # before apply. Mirrors k3d-multinode-e2e.yml (2-file list — no multinode overlay).
+          cp deploy/flux/apps.yaml /tmp/apps-singlenode.yaml
+          cat >> /tmp/apps-singlenode.yaml <<'EOF'
+            patches:
+              - target:
+                  kind: HelmRelease
+                  name: news-aggregator
+                patch: |
+                  - op: add
+                    path: /spec/chart/spec/valuesFiles
+                    value:
+                      - deploy/helm/news-aggregator/values.yaml
+                      - deploy/helm/news-aggregator/values-dev.yaml
+          EOF
+          kubectl apply -f deploy/flux/policies.yaml -f /tmp/apps-singlenode.yaml -f deploy/flux/secrets-sync.yaml
+          kubectl wait --for=condition=Ready --timeout=180s \
+            kustomization/policies -n flux-system
+
+      - name: Wait for the HelmRelease (born with the dev values)
+        # The apps Kustomization patch above makes the HR born with the dev valuesFiles,
+        # so there is no window where helm-controller installs with prod defaults. Verify
+        # the patch took (fail loud if not), then wait for Ready — no post-hoc patch/race.
+        run: |
+          for i in $(seq 1 24); do
+            kubectl get helmrelease news-aggregator -n flux-system >/dev/null 2>&1 && break
+            echo "waiting for apps kustomization to create the HelmRelease ($i)"; sleep 5
+          done
+          kubectl get helmrelease news-aggregator -n flux-system \
+            -o jsonpath='{.spec.chart.spec.valuesFiles}' | grep -q values-dev.yaml \
+            || { echo "FAIL: HelmRelease missing the dev valuesFiles patch"; exit 1; }
+          kubectl wait --for=condition=Ready --timeout=300s \
+            helmrelease/news-aggregator -n flux-system
+
+      - name: Wait for workloads
+        run: |
+          kubectl rollout status -n zone-data statefulset/nats --timeout=180s
+          kubectl rollout status -n zone-data statefulset/postgres --timeout=180s
+          kubectl rollout status -n zone-ingest deployment/ingest-usgs --timeout=180s
+          kubectl rollout status -n zone-process deployment/enrich --timeout=180s
+          kubectl rollout status -n zone-process deployment/writer --timeout=180s
+          kubectl rollout status -n zone-process deployment/cluster --timeout=180s
+          kubectl rollout status -n zone-process deployment/score --timeout=180s
+          kubectl rollout status -n zone-process deployment/retrain --timeout=180s
+          kubectl get pods -A
+
+      - name: "ASSERT: data flows end-to-end under the fences"
+        run: |
+          for i in $(seq 1 30); do
+            N=$(kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -tAc "SELECT count(*) FROM items;" || echo 0)
+            echo "items=$N (try $i)"
+            [ "${N:-0}" -gt 0 ] && break
+            sleep 10
+          done
+          [ "${N:-0}" -gt 0 ] || { kubectl logs -n zone-ingest deploy/ingest-usgs --tail=50; exit 1; }
+          S=$(kubectl exec -n zone-data statefulset/postgres -- \
+            psql -U app -d news -tAc "SELECT count(*) FROM stories;")
+          echo "stories=$S"; [ "${S:-0}" -gt 0 ]
+          C=$(kubectl exec -n zone-data statefulset/postgres -- \
+            psql -U app -d news -tAc "SELECT count(*) FROM items WHERE story_id IS NOT NULL;")
+          echo "clustered=$C"; [ "${C:-0}" -gt 0 ]
+
+      - name: "ASSERT: firehose tally pipeline persists (§6.6 velocity signal)"
+        run: |
+          # The live USGS feed almost never mentions a seed-gazetteer phrase, so
+          # organic tally flushes carry empty counts and the writer skips them
+          # (empty-flush no-op) — entity_tallies would stay 0 no matter how long
+          # we poll. Inject ONE schema-valid item naming a gazetteer entity
+          # through the usgs ingester's own scoped publisher (its creds, its
+          # subject — no extra grants): enrich tallies pre-dedup on receipt, so
+          # the §6.6 signal is deterministic within one 60s flush.
+          kubectl exec -n zone-ingest deploy/ingest-usgs -- python -c '
+          import asyncio
+          from libs.bus import BusConfig, ScopedPublisher, connect
+          from libs.schema import Item, SourceClass
+          async def main():
+              cfg = BusConfig.from_env()
+              nc, js = await connect(cfg)
+              pub = ScopedPublisher(js, "ingest.usgs", cfg.max_msg_bytes)
+              item = Item(source="usgs", source_class=SourceClass.AUTHORITATIVE,
+                          text="M 5.0 - e2e synthetic tremor 10 km SSW of Tokyo (tally probe)")
+              await pub.publish("ingest.usgs", item)
+              await nc.drain()
+          asyncio.run(main())'
+          # enrich flushes tally.minute every 60s; writer persists via its second
+          # durable. Poll past one flush interval.
+          for i in $(seq 1 18); do
+            T=$(kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -tAc "SELECT count(*) FROM entity_tallies;" || echo 0)
+            echo "entity_tallies=$T (try $i)"
+            [ "${T:-0}" -gt 0 ] && break
+            sleep 10
+          done
+          [ "${T:-0}" -gt 0 ] || {
+            kubectl logs -n zone-process deploy/enrich --tail=50
+            kubectl logs -n zone-process deploy/writer --tail=50
+            kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -c "TABLE system_state;"
+            exit 1
+          }
+          # score worker ran a cycle: its §6.8 health beat is in system_state
+          for i in $(seq 1 12); do
+            H=$(kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -tAc "SELECT count(*) FROM system_state WHERE key = 'score';" || echo 0)
+            echo "score-beat=$H (try $i)"
+            [ "${H:-0}" -gt 0 ] && break
+            sleep 10
+          done
+          [ "${H:-0}" -gt 0 ] || { kubectl logs -n zone-process deploy/score --tail=50; exit 1; }
+
+      - name: "ASSERT: read API serves the feed; api_ro grant rejects writes (§6.8/§3.1)"
+        run: |
+          kubectl rollout status -n zone-present deployment/api --timeout=180s
+          kubectl port-forward -n zone-present svc/api 18000:8000 &
+          PF=$!; sleep 3
+          curl -sf localhost:18000/healthz
+          curl -sf "localhost:18000/api/stories?limit=5" | grep -q '"db_degraded":false'
+          curl -sf localhost:18000/api/health | grep -q 'baseline_warming'
+          curl -sf localhost:18000/ | grep -qi "developing stories"   # SPA served
+          kill $PF
+          # The grant is the real fence: a direct INSERT as api_ro must fail.
+          if kubectl exec -n zone-present deploy/api -- python -c '
+          import asyncio, asyncpg, os
+          async def main():
+              c = await asyncpg.connect(os.environ["POSTGRES_DSN"])
+              await c.execute("INSERT INTO system_state (key, value) VALUES ($1, $2::jsonb)", "pwn", "{}")
+          asyncio.run(main())' 2>/tmp/ro.err; then
+            echo "FAIL: api_ro wrote to the DB"; exit 1
+          fi
+          grep -qiE "read-only|permission denied" /tmp/ro.err && echo "api_ro write rejected (correct)"
+
+      - name: "ASSERT: alert push reaches ntfy through the write-only publisher (§6.8)"
+        run: |
+          kubectl rollout status -n zone-present deployment/ntfy deployment/notify --timeout=180s
+          # Synthetic alert row (superuser, like the §6.6 seeding) — notify polls
+          # every 20s and must POST it to the ntfy topic.
+          kubectl exec -n zone-data statefulset/postgres -- psql -U app -d news -c "
+            SELECT ensure_stories_partition(current_date); SELECT ensure_alerts_partition(current_date);
+            INSERT INTO stories (id, first_seen, last_seen, entity_set, trust_state, independent_origins)
+            VALUES ('99999999-9999-9999-9999-999999999999', now(), now(), '[\"tokyo\"]', 'corroborated', 3)
+            ON CONFLICT DO NOTHING;
+            INSERT INTO alerts (story_id, gap, velocity_z, trust_state)
+            VALUES ('99999999-9999-9999-9999-999999999999', 9.9, 12.3, 'corroborated');"
+          kubectl port-forward -n zone-present svc/ntfy 18080:8080 &
+          PF=$!; sleep 3
+          for i in $(seq 1 12); do
+            MSG=$(curl -s "localhost:18080/alerts/json?poll=1" || true)
+            echo "$MSG" | grep -q "Developing story" && break
+            echo "no push yet (try $i)"; sleep 10
+          done
+          kill $PF
+          echo "$MSG" | grep -q "Developing story" || {
+            kubectl logs -n zone-present deploy/notify --tail=50
+            kubectl logs -n zone-present deploy/ntfy --tail=50
+            exit 1
+          }
+          echo "alert push landed on ntfy (correct)"
+          # The fence: anonymous publish must be rejected (read-only default access).
+          CODE=$(kubectl exec -n zone-present deploy/notify -- python -c '
+          import httpx
+          print(httpx.post("http://ntfy.zone-present.svc:8080/alerts", content=b"spoof").status_code)')
+          [ "$CODE" = "403" ] || { echo "FAIL: anonymous ntfy publish returned $CODE"; exit 1; }
+          echo "anonymous publish rejected with 403 (correct)"
+
+      - name: "ASSERT: retrain trains on weak labels, publishes, enrich hot-swaps (§6.3/§4)"
+        run: |
+          # Seed labeled weak-label rows deterministically, above the dev gate floors:
+          # a corroborated story's members are positives (label 1), exploration items are
+          # negatives (label 0) — see the weak_labels VIEW. Superuser insert like the
+          # §6.6 seeding; retrain reads them through the read-only retrain_ro role.
+          kubectl exec -n zone-data statefulset/postgres -- psql -U app -d news -v ON_ERROR_STOP=1 -c "
+            SELECT ensure_items_partition(current_date); SELECT ensure_stories_partition(current_date);
+            INSERT INTO stories (id, first_seen, last_seen, entity_set, trust_state, independent_origins)
+            VALUES ('88888888-8888-8888-8888-888888888888', now(), now(), '[\"seed\"]', 'corroborated', 3)
+            ON CONFLICT DO NOTHING;
+            INSERT INTO items (id, source, source_class, ts_observed, text, story_id)
+            SELECT gen_random_uuid(), 'seed', 'primary', now(),
+                   'breaking major earthquake strikes near the capital sample ' || g,
+                   '88888888-8888-8888-8888-888888888888'
+            FROM generate_series(1,5) g;
+            INSERT INTO items (id, source, source_class, ts_observed, text, exploration)
+            SELECT gen_random_uuid(), 'seed', 'social', now(),
+                   'had a quiet pleasant lunch with friends today sample ' || g, true
+            FROM generate_series(1,5) g;"
+          # retrain runs every 30s (dev): wait for a beat that PROMOTED a model.
+          for i in $(seq 1 18); do
+            P=$(kubectl exec -n zone-data statefulset/postgres -- \
+              psql -U app -d news -tAc "SELECT value->>'promoted' FROM system_state WHERE key='retrain';" || true)
+            echo "retrain promoted=$P (try $i)"
+            [ "$P" = "true" ] && break
+            sleep 10
+          done
+          [ "$P" = "true" ] || {
+            kubectl logs -n zone-process deploy/retrain --tail=60
+            kubectl exec -n zone-data statefulset/postgres -- psql -U app -d news -c "TABLE system_state;"
+            exit 1
+          }
+          echo "retrain promoted a model to the KV (correct)"
+          # enrich polls the models KV every 10s (dev) and must hot-swap the artifact.
+          for i in $(seq 1 12); do
+            kubectl logs -n zone-process deploy/enrich --tail=200 | grep -q "hot-swapped classifier" && break
+            echo "enrich hot-swap not seen yet (try $i)"; sleep 10
+          done
+          kubectl logs -n zone-process deploy/enrich --tail=200 | grep -q "hot-swapped classifier" || {
+            kubectl logs -n zone-process deploy/enrich --tail=80
+            kubectl logs -n zone-process deploy/retrain --tail=40
+            exit 1
+          }
+          echo "enrich hot-swapped the retrained classifier (correct)"
+
+      - name: "ASSERT: NetworkPolicy denials (§3.3 split is real)"
+        run: |
+          probe='import socket,sys;s=socket.socket();s.settimeout(4)
+          s.connect(("postgres.zone-data.svc",5432));print("CONNECTED")'
+          # inference pod must NOT reach Postgres
+          if kubectl exec -n zone-process deploy/enrich -- python -c "$probe" 2>/dev/null; then
+            echo "FAIL: enrich (inference) reached Postgres"; exit 1
+          fi; echo "enrich -> postgres: blocked (correct)"
+          # ingester must NOT reach Postgres
+          if kubectl exec -n zone-ingest deploy/ingest-usgs -- python -c "$probe" 2>/dev/null; then
+            echo "FAIL: usgs (ingester) reached Postgres"; exit 1
+          fi; echo "usgs -> postgres: blocked (correct)"
+          # db-writer MUST reach Postgres
+          kubectl exec -n zone-process deploy/writer -- python -c "$probe"
+          echo "writer -> postgres: allowed (correct)"
+
+      - name: "ASSERT: PSS restricted rejects a privileged pod"
+        run: |
+          if kubectl run pss-probe -n zone-ingest --image=busybox --restart=Never \
+            --overrides='{"spec":{"containers":[{"name":"c","image":"busybox","securityContext":{"privileged":true}}]}}' 2>/tmp/pss.err; then
+            echo "FAIL: privileged pod admitted into zone-ingest"; exit 1
+          fi
+          grep -qi "violates PodSecurity" /tmp/pss.err && echo "PSS rejection confirmed"
+
+      - name: "ASSERT: in-cluster SOPS/age decryption (throwaway key, OCI artifact)"
+        run: |
+          age-keygen -o /tmp/age.key 2>/dev/null
+          PUB=$(grep -oP 'public key: \K.*' /tmp/age.key)
+          kubectl -n flux-system create secret generic sops-age \
+            --from-file=age.agekey=/tmp/age.key
+          mkdir -p /tmp/sec
+          kubectl create secret generic ghcr-pull -n zone-ingest \
+            --from-literal=marker=dummy-e2e-value --dry-run=client -o yaml > /tmp/sec/ghcr-pull.sops.yaml
+          # cd out of the repo: sops discovers ./.sops.yaml from cwd and its
+          # creation rules (deploy/secrets/* only) would veto this /tmp path
+          (cd /tmp/sec && sops --encrypt --age "$PUB" \
+            --encrypted-regex '^(data|stringData)$' --in-place ghcr-pull.sops.yaml)
+          ! grep -q dummy-e2e-value /tmp/sec/ghcr-pull.sops.yaml  # ciphertext only
+          flux push artifact oci://localhost:5001/e2e-secrets:test --path=/tmp/sec \
+            --source="e2e" --revision="test"
+          # pods can't resolve the k3d registry NAME (k3d only wires it into
+          # containerd, not cluster DNS) — use its docker-network IP
+          REG_NAME=$(docker ps --format '{{.Names}}' | grep 'e2e-reg')
+          echo "registry container: $REG_NAME"
+          # the container sits on BOTH bridge and the k3d net - ranging over all
+          # networks CONCATENATES the IPs; scope to the cluster network
+          REG_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "k3d-e2e").IPAddress}}' "$REG_NAME")
+          echo "registry IP on k3d-e2e net: $REG_IP"
+          flux create source oci e2e-secrets --url="oci://${REG_IP}:5000/e2e-secrets" \
+            --tag=test --insecure
+          flux create kustomization e2e-secrets --source=OCIRepository/e2e-secrets \
+            --path=. --prune=true --decryption-provider=sops \
+            --decryption-secret=sops-age --wait --timeout=90s
+          VAL=$(kubectl get secret ghcr-pull -n zone-ingest -o jsonpath='{.data.marker}' | base64 -d)
+          [ "$VAL" = "dummy-e2e-value" ] && echo "SOPS decryption round-trip confirmed"
+
+      - name: "ASSERT: llm.heavy gate stayed closed (single-source USGS)"
+        run: |
+          kubectl exec -n zone-data statefulset/nats -- \
+            wget -qO- http://localhost:8222/jsz?streams=true | grep -o '"name":"LLM_HEAVY"[^}]*' || true
+          echo "gate check is informational on single-source input"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -40 || true
+          flux get all -A || true
+          kubectl logs -n zone-process deploy/enrich --tail=40 || true
+          kubectl logs -n zone-data statefulset/nats --tail=40 || true
+          # Any pod that is not Ready: describe it and dump current+previous logs —
+          # the 2026-07-05 api crashloop was undebuggable without these.
+          kubectl get pods -A --no-headers | awk '$3 != "Running" || $2 !~ /^([0-9]+)\/\1$/ {print $1, $2}' \
+          | while read -r ns pod; do
+              echo "=== describe $ns/$pod ==="; kubectl describe pod -n "$ns" "$pod" | tail -25 || true
+              echo "=== logs $ns/$pod ==="; kubectl logs -n "$ns" "$pod" --tail=40 || true
+              echo "=== previous logs $ns/$pod ==="; kubectl logs -n "$ns" "$pod" --previous --tail=40 || true
+            done

@@ -1,0 +1,109 @@
+/* Dashboard (PLAN §6.8). Vendored, no CDN — zone-present has no internet.
+   Colors follow the dataviz method: series/status slots validated against both
+   surfaces; text always wears text tokens, never a series color. */
+
+:root {
+  --surface-1: #fcfcfb;
+  --surface-2: #f0efec;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #8a887f;
+  --series-1: #2a78d6;      /* sparkline hue (single series) */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --border: #dedcd6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-1: #1a1a19;
+    --surface-2: #383835;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8a887f;
+    --series-1: #3987e5;
+    --border: #3d3c38;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface-1); color: var(--text-primary);
+  font: 14px/1.45 system-ui, sans-serif;
+}
+header { padding: 14px 20px 0; }
+h1 { font-size: 18px; margin: 0 0 8px; }
+h2 { font-size: 13px; color: var(--text-secondary); text-transform: uppercase;
+     letter-spacing: .04em; margin: 18px 0 8px; }
+.hint { text-transform: none; letter-spacing: 0; color: var(--text-muted); font-weight: normal; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 0 24px; padding: 0 20px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+footer { padding: 14px 20px; color: var(--text-muted); font-size: 12px; }
+
+/* §6.8 health banners — status color + icon + label, never color alone */
+#banners { display: flex; gap: 8px; flex-wrap: wrap; }
+.banner {
+  padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary);
+}
+.banner::before { margin-right: 6px; }
+.banner.warning::before { content: "⚠"; color: var(--status-warning); }
+.banner.critical::before { content: "⛔"; color: var(--status-critical); }
+.banner.ok::before { content: "●"; color: var(--status-good); }
+
+/* Story feed */
+.story {
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  margin-bottom: 8px; cursor: pointer;
+}
+.story:hover { background: var(--surface-2); }
+.story-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.gap-num { font-size: 20px; font-weight: 700; min-width: 56px; font-variant-numeric: tabular-nums; }
+.entities { font-weight: 600; }
+.story-meta { display: flex; gap: 14px; align-items: center; margin-top: 6px;
+              color: var(--text-secondary); font-size: 12px; flex-wrap: wrap; }
+.spark { flex: none; }
+.spark polyline { fill: none; stroke: var(--series-1); stroke-width: 2; }
+.spark .fillarea { fill: var(--series-1); opacity: .15; stroke: none; }
+
+/* trust badge: label always present — color never carries meaning alone */
+.badge {
+  font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  border: 1.5px solid var(--text-muted); color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: .03em;
+}
+.badge.corroborated { border-color: var(--status-good); color: var(--text-primary); }
+.badge.primary_backed { border-color: var(--series-1); color: var(--text-primary); }
+
+/* mainstream presence: tiny meter + numeric label (not color-alone) */
+.meter { display: inline-flex; align-items: center; gap: 6px; }
+.meter .track { width: 60px; height: 6px; border-radius: 3px; background: var(--surface-2);
+                border: 1px solid var(--border); overflow: hidden; }
+.meter .fill { height: 100%; background: var(--text-muted); }
+
+.story-detail { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.item { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+.item:last-child { border-bottom: none; }
+.item .src { color: var(--text-secondary); font-size: 12px; }
+.item .txt { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Alerts + system panel */
+.alert-row { border-left: 3px solid var(--status-critical); padding: 6px 10px;
+             margin-bottom: 6px; background: var(--surface-2); border-radius: 0 4px 4px 0; }
+.alert-row .when { color: var(--text-muted); font-size: 12px; }
+.kv { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.kv b { color: var(--text-primary); }
+.empty { color: var(--text-muted); font-style: italic; padding: 8px 0; }
+
+/* feed view tabs (gap feed · trust watchlists · weather) */
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tab {
+  padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  cursor: pointer; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--text-secondary);
+}
+.tab:hover { background: var(--surface-2); }
+.tab.active {
+  background: var(--surface-2); color: var(--text-primary);
+  border-color: var(--series-1);
+}

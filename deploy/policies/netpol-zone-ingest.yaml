@@ -1,0 +1,100 @@
+# zone-ingest (DMZ, PLAN §3.1): default-deny; each ingester may reach ONLY its
+# upstream + NATS publish. No DB route, no lateral movement.
+#
+# KNOWN GAP (vanilla NetworkPolicy cannot match hostnames): "only its upstream host"
+# is approximated as "TCP/443 to non-private address space" — a compromised ingester
+# can reach the public internet on 443 but nothing inside the cluster/LAN. True
+# per-FQDN allow-lists need Cilium (CiliumNetworkPolicy toFQDNs) or an egress proxy;
+# decide at 0b. The private-CIDR `except` list is the load-bearing part today.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: zone-ingest
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: zone-ingest
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nats-publish
+  namespace: zone-ingest
+spec:
+  podSelector:
+    matchLabels:
+      role: ingester
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              zone: data
+          podSelector:
+            matchLabels:
+              app: nats
+      ports:
+        - { protocol: TCP, port: 4222 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-upstream-https
+  namespace: zone-ingest
+spec:
+  podSelector:
+    matchLabels:
+      role: ingester
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8 # cluster + RFC1918
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16 # link-local / cloud metadata
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# Prometheus (zone-data) may scrape the named `metrics` container port only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-scrape
+  namespace: zone-ingest
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zone: data
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - { protocol: TCP, port: metrics }

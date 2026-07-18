@@ -1,0 +1,55 @@
+[project]
+name = "news-aggregator"
+version = "0.0.0"
+description = "OSINT developing-story aggregator (see PLAN.md)"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+# Per-zone dependency sets keep hardened images minimal (PLAN §3.2).
+bus = ["nats-py>=2.7"]
+ingest = ["httpx>=0.27", "websockets>=12", "nats-py>=2.7", "defusedxml>=0.7"]
+enrich = [
+    "nats-py>=2.7",
+    "asyncpg>=0.29",
+    "pgvector>=0.3",
+    "numpy>=1.26",
+    "onnxruntime>=1.18",  # §6.3 hot-swap: run the retrained ONNX classifier for real
+]
+onnx = ["onnxruntime>=1.18"]  # real embedder; 0a uses the hash fallback without it
+# §6.3 step 4 / §6.4 claim extraction: llm.heavy consumer -> local Ollama -> claim.*.
+# Deliberately tiny — NO DB, NO numpy (holds no DB creds; it parses untrusted text through
+# the model, PLAN §3.3). httpx is the Ollama client (libs/llm).
+claimx = ["nats-py>=2.7", "httpx>=0.27"]
+# §6.3 step 2 retrain loop: numpy LR trainer + ONNX authoring (no sklearn) + runtime.
+retrain = ["nats-py>=2.7", "asyncpg>=0.29", "numpy>=1.26", "onnx>=1.16", "onnxruntime>=1.18"]
+# zone-present read API + alert notifier (§6.8; httpx = notify's ntfy client)
+api = ["fastapi>=0.115", "uvicorn>=0.30", "asyncpg>=0.29", "httpx>=0.27"]
+llm = ["httpx>=0.27"]  # local Ollama client (PLAN §6.3); Phase 2 enrichment
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["libs*", "services*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+ignore = ["S101"]  # allow asserts in tests
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]  # flat layout: import libs/services without an editable install

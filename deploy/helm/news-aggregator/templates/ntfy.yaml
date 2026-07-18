@@ -1,0 +1,100 @@
+{{- if .Values.ntfy.enabled }}
+# Self-hosted ntfy push server (PLAN §6.8): alerts reach the user's devices with
+# ZERO third-party egress — LAN-only behind traefik (host-routed: ntfy cannot
+# serve under a sub-path). auth-default-access=read-only: any LAN device may
+# subscribe to the topic; only the declaratively-provisioned `publisher` user
+# (the notify pod, bcrypt hash below) may write, so alerts cannot be spoofed.
+# Stateless by design: no message cache PVC — missed pushes re-derive from the
+# alerts table (services/notify re-polls), the DB is the source of truth.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ntfy
+  namespace: zone-present
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ntfy
+  template:
+    metadata:
+      labels:
+        app: ntfy
+        role: ntfy
+    spec:
+      serviceAccountName: ntfy
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: ntfy
+          image: {{ .Values.images.ntfy | quote }}
+          args: ["serve"]
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 8080, name: http }
+          env:
+            - name: NTFY_LISTEN_HTTP
+              value: ":8080" # nonroot cannot bind the image default :80
+            - name: NTFY_BASE_URL
+              value: "http://{{ .Values.ntfy.host }}"
+            - name: NTFY_BEHIND_PROXY
+              value: "true"
+            - name: NTFY_AUTH_FILE
+              value: /var/lib/ntfy/user.db
+            - name: NTFY_AUTH_DEFAULT_ACCESS
+              value: read-only
+            # Declarative provisioning (ntfy >= 2.14): bcrypt hash only — the
+            # plaintext stays in the ntfy-pub Secret with the notify pod.
+            - name: NTFY_AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: ntfy-pub
+                  key: auth-users
+            - name: NTFY_AUTH_ACCESS
+              value: "publisher:{{ .Values.ntfy.topic }}:write-only"
+          volumeMounts:
+            - { name: state, mountPath: /var/lib/ntfy }
+          readinessProbe:
+            httpGet: { path: /v1/health, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources: {{- toYaml .Values.ntfy.resources | nindent 12 }}
+      volumes:
+        - name: state
+          emptyDir: {} # auth db only, re-provisioned from env every start
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ntfy
+  namespace: zone-present
+spec:
+  selector:
+    app: ntfy
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# Host-routed through traefik (the api keeps path `/` on the default host).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ntfy
+  namespace: zone-present
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.ntfy.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ntfy
+                port: { name: http }
+{{- end }}

@@ -1,0 +1,51 @@
+{{- if .Values.gdelt.enabled }}
+# GDELT mainstream-baseline ingester (zone-ingest DMZ): parses internet data =>
+# least power (PLAN §3.1). role=ingester matches the netpol allowing ONLY
+# upstream-443 + NATS publish. Disabled in values-dev (see noaa.yaml note).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-gdelt
+  namespace: zone-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gdelt
+  template:
+    metadata:
+      labels:
+        app: gdelt
+        role: ingester
+    spec:
+      serviceAccountName: ingest-gdelt
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: gdelt
+          image: {{ include "na.image" (list "gdelt" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.ingest.gdelt.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-gdelt
+                  key: password
+            - name: NATS_URL
+              value: "nats://gdelt:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: GDELT_QUERY
+              value: {{ .Values.gdelt.query | quote }}
+            - name: GDELT_POLL_SECONDS
+              value: {{ .Values.gdelt.pollSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.gdelt.resources | nindent 12 }}
+{{- end }}

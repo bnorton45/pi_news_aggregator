@@ -1,0 +1,14 @@
+# Multi-node e2e overlay: layered on top of values-dev.yaml by
+# .github/workflows/k3d-multinode-e2e.yml to turn ON the placement machinery the
+# single-node dev overlay leaves off. Everything else (local images, blank digests,
+# single-source ingest, tiny resources) deep-merges through from values-dev.yaml.
+#
+# Storage deliberately stays local-path, NOT Longhorn: k3d nodes are containers
+# (iscsi/attach is flaky) and local-path PVCs are node-bound anyway, so state-node
+# failover + Longhorn remains the residual hardware-gated test (PLAN §2).
+
+topology:
+  enabled: true
+
+priorityClasses:
+  enabled: true

@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+models
+.data
+*.onnx
+deploy
+docs
+*.md

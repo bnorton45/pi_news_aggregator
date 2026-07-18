@@ -1,0 +1,42 @@
+# Trust zones (PLAN §3.1): one namespace per layer, Pod Security Standard `restricted`
+# enforced at admission (PLAN §3.2). Least power for whatever parses internet data.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zone-ingest
+  labels:
+    zone: ingest # DMZ: parses attacker-controllable internet data
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zone-process
+  labels:
+    zone: process # inference (no DB) + db-writer/cluster (DB-RW) + Ollama
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zone-data
+  labels:
+    zone: data # Postgres+pgvector, NATS JetStream, Prometheus/Grafana — no internet
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zone-present
+  labels:
+    zone: present # read API + dashboard; the only zone a user reaches
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

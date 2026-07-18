@@ -1,0 +1,9 @@
+# Extends the default gitleaks rules (PLAN §3.6 gates 2-3).
+# .secrets.baseline holds detect-secrets AUDIT entries — SHA1 hashes of reviewed
+# false positives (flux flag names like --decryption-secret=...), not material.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "detect-secrets baseline stores hashes of audited false positives"
+paths = ['''\.secrets\.baseline$''']

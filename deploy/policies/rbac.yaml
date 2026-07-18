@@ -1,0 +1,150 @@
+# Least-priv RBAC (PLAN §3.1): NO application workload talks to the Kubernetes API,
+# so there are deliberately ZERO Roles/RoleBindings here — the least privilege is no
+# privilege. Every ServiceAccount sets automountServiceAccountToken: false, and each
+# zone's `default` SA is overridden likewise so an unlabeled pod gets no token either.
+# (Flux/monitoring controllers bring their own RBAC in their own namespaces.)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: default, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: default, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: default, namespace: zone-data }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: default, namespace: zone-present }
+automountServiceAccountToken: false
+---
+# zone-ingest — one SA per ingester so a compromised image can be revoked alone.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-usgs, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-noaa, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-gdacs, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-wikipedia, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-bluesky, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-mastodon, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-gdelt, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-state, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-dod, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-cisa, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ingest-cdc, namespace: zone-ingest }
+automountServiceAccountToken: false
+---
+# zone-process — the §3.3 split: inference SAs (parse untrusted text, no DB creds)
+# vs structured-data SAs (db-writer, cluster, trust: DB-RW, parse nothing raw).
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: inference, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: claimx, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: db-writer, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: cluster, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: trust, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: score, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: retrain, namespace: zone-process }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ollama, namespace: zone-process }
+automountServiceAccountToken: false
+---
+# zone-data
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: nats, namespace: zone-data }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: postgres, namespace: zone-data }
+automountServiceAccountToken: false
+---
+# zone-present
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: api, namespace: zone-present }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: notify, namespace: zone-present }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ntfy, namespace: zone-present }
+automountServiceAccountToken: false

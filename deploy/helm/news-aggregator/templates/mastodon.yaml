@@ -1,0 +1,53 @@
+{{- if .Values.mastodon.enabled }}
+# Mastodon ingester (zone-ingest DMZ): parses internet data => least power (PLAN
+# §3.1). role=ingester matches the netpol allowing ONLY upstream-443 + NATS publish.
+# Disabled in values-dev: the CI e2e stays single-source (see noaa.yaml note).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-mastodon
+  namespace: zone-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mastodon
+  template:
+    metadata:
+      labels:
+        app: mastodon
+        role: ingester
+    spec:
+      serviceAccountName: ingest-mastodon
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: mastodon
+          image: {{ include "na.image" (list "mastodon" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.ingest.mastodon.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-mastodon
+                  key: password
+            - name: NATS_URL
+              value: "nats://mastodon:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: MASTO_INSTANCES
+              value: {{ .Values.mastodon.instances | join "," | quote }}
+            - name: MASTO_LANGS
+              value: {{ .Values.mastodon.langs | join "," | quote }}
+            - name: MASTO_POLL_SECONDS
+              value: {{ .Values.mastodon.pollSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.mastodon.resources | nindent 12 }}
+{{- end }}

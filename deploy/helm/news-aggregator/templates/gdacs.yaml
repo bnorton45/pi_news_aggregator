@@ -1,0 +1,49 @@
+{{- if .Values.gdacs.enabled }}
+# GDACS ingester (zone-ingest DMZ): parses internet data => least power (PLAN §3.1).
+# role=ingester matches the netpol allowing ONLY upstream-443 + NATS publish.
+# Disabled in values-dev: the CI e2e stays single-source (see noaa.yaml note).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-gdacs
+  namespace: zone-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gdacs
+  template:
+    metadata:
+      labels:
+        app: gdacs
+        role: ingester
+    spec:
+      serviceAccountName: ingest-gdacs
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: gdacs
+          image: {{ include "na.image" (list "gdacs" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.ingest.gdacs.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-gdacs
+                  key: password
+            - name: NATS_URL
+              value: "nats://gdacs:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: GDACS_POLL_SECONDS
+              value: {{ .Values.gdacs.pollSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.gdacs.resources | nindent 12 }}
+{{- end }}

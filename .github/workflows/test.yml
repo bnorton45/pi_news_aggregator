@@ -1,0 +1,39 @@
+# PLAN §10: lint + unit tests on every push/PR. Backs the local pre-commit ruff
+# gate and exercises the enrich libs (dedup, gazetteer, classify, ner, schema)
+# without a Pi. Fast — pure-Python, no services.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12" # match the container pin (PLAN §7)
+
+      - name: install (dev + ingest + api + enrich + llm + retrain extras)
+        # Pin ruff to the pre-commit rev (.pre-commit-config.yaml) so CI lint/format
+        # matches the local gate exactly — a newer ruff can change rules/formatting.
+        # retrain pulls in onnx (graph authoring) so the train/eval round-trip tests run.
+        # ingest brings httpx + defusedxml for the RSS/poll-runner tests (test_state).
+        # api brings fastapi/uvicorn so services.api.main is importable for read-API tests.
+        run: pip install -e ".[dev,ingest,api,enrich,llm,retrain]" "ruff==0.6.9"
+
+      - name: ruff lint
+        run: ruff check .
+
+      - name: ruff format check
+        run: ruff format --check .
+
+      - name: pytest
+        run: pytest -q

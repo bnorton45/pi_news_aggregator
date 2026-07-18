@@ -1,0 +1,435 @@
+# Fast inner-loop data path (PLAN §10 phase 0a parity target).
+# USGS -> NATS(JetStream) -> enrich(filter/govern/embed) -> Postgres/pgvector.
+# This is NOT the hardened deployment (that's deploy/ on k3d/Pi) — it's the
+# dev-box loop that proves the application logic without a single Pi.
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]   # JetStream + HTTP monitoring (healthz)
+    ports: ["4222:4222"]
+    volumes: ["nats-data:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      # Dev-only defaults, overridable via .env / shell. The cluster never uses
+      # these — it generates Postgres creds in-cluster (PLAN §3.5). No literal
+      # credential is committed (keeps secret scanners quiet, by design).
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-news}
+      POSTGRES_RO_PASSWORD: ${POSTGRES_RO_PASSWORD:-api}
+      POSTGRES_RETRAIN_PASSWORD: ${POSTGRES_RETRAIN_PASSWORD:-retrain} # pragma: allowlist secret
+    ports: ["5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./libs/schema/schema.sql:/docker-entrypoint-initdb.d/10_schema.sql:ro
+      - ./libs/schema/readonly_role.sh:/docker-entrypoint-initdb.d/20_readonly_role.sh:ro
+      - ./libs/schema/retrain_role.sh:/docker-entrypoint-initdb.d/30_retrain_role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d news"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  usgs:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.usgs.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      USGS_POLL_SECONDS: "30"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true                   # mirror the hardened posture (PLAN §3.2)
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  noaa:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.noaa.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      NOAA_POLL_SECONDS: "120"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  state:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.state.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      STATE_POLL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  dod:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.dod.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DOD_POLL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  cisa:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.cisa.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      CISA_POLL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  cdc:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.cdc.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      CDC_POLL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  gdacs:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.gdacs.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      GDACS_POLL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  wikipedia:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.wikipedia.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      WIKI_DOMAINS: en.wikipedia.org
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  bluesky:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.bluesky.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      BSKY_LANGS: en
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  mastodon:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.mastodon.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      MASTO_INSTANCES: mstdn.social,mas.to,fosstodon.org
+      MASTO_LANGS: en
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  gdelt:
+    build:
+      context: .
+      args: { EXTRA: ingest }
+    command: ["python", "-m", "services.ingest.gdelt.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      GDELT_POLL_SECONDS: "120"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Inference worker (PLAN §3.3): parses untrusted text, NO DB creds. Publishes
+  # validated EnrichedItem on enriched.* — the writer is the only thing that touches PG.
+  enrich:
+    build:
+      context: .
+      args: { EXTRA: enrich }
+    command: ["python", "-m", "services.enrich.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DEDUP_KV_BUCKET: dedup   # exercise the shared NATS-KV deduper in the dev loop (PLAN §6.3 step 2)
+      MODELS_KV_BUCKET: models # §6.3 hot-swap: watch for the retrained classifier
+      MODELS_POLL_S: "10"
+      # Real ONNX models (§6.3 step 3/4) — int8, populated by scripts/fetch-models.sh (the
+      # only shipped precision: 4x smaller, decision-equivalent, docs/pi-throughput-findings.md).
+      # Absent ⇒ load_embedder/load_ner fall back to hash/no-op stubs, so the loop runs anyway.
+      EMBED_MODEL_PATH: /models/bge-small
+      NER_MODEL_PATH: /models/ner
+      LOG_LEVEL: INFO
+    volumes:
+      - ./models:/models:ro   # gitignored; read-only mount is fine under read_only rootfs
+    depends_on:
+      nats: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # DB-writer (PLAN §3.3): the only DB-RW process; consumes enriched.* -> pgvector.
+  writer:
+    build:
+      context: .
+      args: { EXTRA: enrich }
+    command: ["python", "-m", "services.writer.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-news}
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Cluster (PLAN §6.4): partition-pruned ANN assigns Items to Stories; gates llm.heavy.
+  # Structured-data pod like the writer (no model over raw text) so DB access is OK (§3.3).
+  # claimx is NOT in the dev loop — it needs an Ollama host (Phase-2 hardware).
+  cluster:
+    build:
+      context: .
+      args: { EXTRA: enrich }
+    command: ["python", "-m", "services.cluster.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-news}
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Read API + dashboard (PLAN §6.8): SELECT-only api_ro role, serves the SPA.
+  api:
+    build:
+      context: .
+      args: { EXTRA: api }
+    command: ["python", "-m", "services.api.main"]
+    environment:
+      POSTGRES_DSN: postgresql://api_ro:${POSTGRES_RO_PASSWORD:-api}@postgres:5432/${POSTGRES_DB:-news}
+      LOG_LEVEL: INFO
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Self-hosted push server (PLAN §6.8): read-only default access, write-only
+  # dev `publisher` user (declarative bcrypt — dev creds only, the cluster
+  # generates its own in-cluster; $$ = compose escaping, not a secret leak).
+  ntfy:
+    image: binwiederhier/ntfy:v2.14.0
+    command: ["serve"]
+    environment:
+      NTFY_LISTEN_HTTP: ":8080"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: read-only
+      NTFY_AUTH_USERS: "publisher:$$2y$$10$$APghFiOdKb1sZOgrgWLAYOtmXjaCE.GVaWR5UjirwQxyGl.FNJuGC:user" # pragma: allowlist secret
+      NTFY_AUTH_ACCESS: "publisher:alerts:write-only"
+    ports: ["8090:8080"]
+    read_only: true
+    tmpfs: ["/var/lib/ntfy"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Alert push notifier (PLAN §6.8): alerts table (api_ro) -> ntfy publisher.
+  notify:
+    build:
+      context: .
+      args: { EXTRA: api }
+    command: ["python", "-m", "services.notify.main"]
+    environment:
+      POSTGRES_DSN: postgresql://api_ro:${POSTGRES_RO_PASSWORD:-api}@postgres:5432/${POSTGRES_DB:-news}
+      NTFY_URL: http://ntfy:8080
+      NTFY_PASSWORD: devpass # pragma: allowlist secret
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres: { condition: service_healthy }
+      ntfy: { condition: service_started }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Score worker (PLAN §6.6/§6.8): gap scoring + alerts off the firehose tallies.
+  # DB-only structured-data pod — no NATS env at all.
+  score:
+    build:
+      context: .
+      args: { EXTRA: enrich }
+    command: ["python", "-m", "services.score.main"]
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-news}
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Retrain worker (PLAN §6.3 step 2/§4): weak labels -> train -> eval gate -> models KV;
+  # enrich hot-swaps. Reads via the read-only retrain_ro role; writes only system_state.
+  # Fast dev knobs so the loop completes in the inner loop instead of every 6h.
+  retrain:
+    build:
+      context: .
+      args: { EXTRA: retrain }
+    command: ["python", "-m", "services.retrain.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      POSTGRES_DSN: postgresql://retrain_ro:${POSTGRES_RETRAIN_PASSWORD:-retrain}@postgres:5432/${POSTGRES_DB:-news}
+      MODELS_KV_BUCKET: models
+      RETRAIN_INTERVAL_S: "30"
+      RETRAIN_MIN_ROWS: "4"
+      RETRAIN_MIN_PER_CLASS: "2"
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # Trust worker (PLAN §6.5): claim-level primary-record matching -> PRIMARY_BACKED.
+  # Structured-data pod (parameterized SQL, no model); NATS consume-only on CLAIM.
+  # Idle without claimx (needs an Ollama host), but proves boot/creds/DB wiring.
+  trust:
+    build:
+      context: .
+      args: { EXTRA: enrich }
+    command: ["python", "-m", "services.trust.main"]
+    environment:
+      NATS_URL: nats://nats:4222
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-news}
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  # ── Local claim-extraction LLM (PLAN §6.3 step 4 / §6.4) — OPT-IN ────────────────────
+  # Enable with `docker compose --profile llm up`. Kept out of the default loop because
+  # the model pull is multi-GB and 4B CPU inference is slow. cluster already publishes
+  # ClaimRequests to the LLM_HEAVY stream for candidate Stories (≥2 origins) and trust
+  # already consumes claim.* — this adds the missing worker + a local Ollama. In k8s this
+  # is the in-cluster Ollama on the compute nodes (follow-up: not in the build matrix/helm).
+  ollama:
+    image: ollama/ollama:0.31.2
+    profiles: ["llm"]
+    volumes:
+      - ollama-models:/root/.ollama   # models + runtime state (no read_only rootfs here)
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: pull the model into the shared volume, then exit 0. claimx waits on this so
+  # it never hits Ollama before the model is resident.
+  ollama-pull:
+    image: ollama/ollama:0.31.2
+    profiles: ["llm"]
+    depends_on:
+      ollama: { condition: service_healthy }
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${OLLAMA_MODEL:-qwen3:1.7b}"]
+    restart: "no"
+
+  # Claim-extraction worker (PLAN §6.3 tiering, §3.3): llm.heavy -> Ollama -> claim.*.
+  # NO DB creds — it parses untrusted text through the model (the RCE surface).
+  # Model = qwen3:1.7b (small non-reasoner): claim extraction is simple/extractive, and the
+  # 4B reasons-INTO-content even non-thinking → 40-280s of garbage/claim (measured,
+  # docs/pi-throughput-findings.md). The 4B stays the model for summarize/entity-res/brief.
+  claimx:
+    build:
+      context: .
+      args: { EXTRA: claimx }
+    profiles: ["llm"]
+    command: ["python", "-m", "services.cluster.claimx"]
+    environment:
+      NATS_URL: nats://nats:4222
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
+      LOG_LEVEL: INFO
+    depends_on:
+      nats: { condition: service_healthy }
+      ollama-pull: { condition: service_completed_successfully }
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  nats-data:
+  pg-data:
+  ollama-models:

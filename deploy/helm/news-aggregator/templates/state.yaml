@@ -1,0 +1,54 @@
+{{- if .Values.state.enabled }}
+# U.S. Dept of State press-release ingester (zone-ingest DMZ): parses internet data
+# => least power (PLAN §3.1). role=ingester matches the netpol allowing ONLY
+# upstream-443 + NATS publish. Disabled in values-dev: the CI e2e stays single-source
+# (its llm.heavy gate assert depends on origins=1), and each source keeps its own switch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-state
+  namespace: zone-ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: state
+  template:
+    metadata:
+      labels:
+        app: state
+        role: ingester
+    spec:
+      serviceAccountName: ingest-state
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: state
+          image: {{ include "na.image" (list "state" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.ingest.state.main"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-state
+                  key: password
+            - name: NATS_URL
+              value: "nats://state:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: STATE_POLL_SECONDS
+              value: {{ .Values.state.pollSeconds | quote }}
+            {{- if .Values.state.userAgent }}
+            - name: STATE_USER_AGENT
+              value: {{ .Values.state.userAgent | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.state.resources | nindent 12 }}
+{{- end }}

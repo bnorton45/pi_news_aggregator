@@ -1,0 +1,87 @@
+# NATS JetStream (zone-data): config is the AUTHORED accounts file (deploy/policies/
+# nats-accounts.conf, copied into files/ — sync enforced by tests/test_deploy_sync.py);
+# per-user passwords resolve from the generated Secret via env (PLAN §3.5).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: zone-data
+data:
+  nats.conf: |
+{{ .Files.Get "files/nats-accounts.conf" | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: zone-data
+spec:
+  selector:
+    app: nats
+  ports:
+    - { name: client, port: 4222, targetPort: 4222 }
+    - { name: monitor, port: 8222, targetPort: 8222 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: zone-data
+spec:
+  serviceName: nats
+  replicas: 1 # 3-way JetStream clustering is a 0b topology change
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      serviceAccountName: nats
+      automountServiceAccountToken: false
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-state
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 1000 | nindent 6 }}
+      containers:
+        - name: nats
+          image: {{ .Values.images.nats }}
+          args: ["-c", "/etc/nats/nats.conf"]
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 4222, name: client }
+            - { containerPort: 8222, name: monitor }
+          env:
+            {{- range $u := list "sys" "usgs" "noaa" "gdacs" "wikipedia" "bluesky" "mastodon" "gdelt" "state" "dod" "cisa" "cdc" "enrich" "writer" "cluster" "claimx" "trust" "retrain" }}
+            - name: NATS_PASS_{{ upper $u }}
+              valueFrom:
+                secretKeyRef:
+                  name: nats-creds
+                  key: pass-{{ $u }}
+            {{- end }}
+          resources: {{- toYaml .Values.nats.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/nats, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8222 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: nats-config
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.nats }}

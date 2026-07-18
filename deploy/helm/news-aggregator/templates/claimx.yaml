@@ -1,0 +1,60 @@
+{{- if .Values.claimx.enabled }}
+# Claim-extraction worker (PLAN §6.3 tiering, §3.3): the LLM client of the clustering
+# layer. Consumes ClaimRequest off the gated `llm.heavy` queue, runs the local Ollama
+# small model (qwen3:1.7b) to isolate the factual assertion, publishes ClaimResult on
+# `claim.*`. The 4B is rejected here — it reasons INTO content on this extractive task
+# (docs/pi-throughput-findings.md).
+#
+# SECURITY (PLAN §3.3): role=inference — it *parses untrusted text through a model* (the
+# RCE surface), so it holds NO DB credential and the netpol gives it no route to Postgres;
+# it may reach only NATS (JetStream) and Ollama (11434). Runs nonroot under a read-only
+# rootfs. Scales to 0 when ollama is disabled (dev overlays).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claimx
+  namespace: zone-process
+spec:
+  replicas: {{ .Values.claimx.replicas }}
+  selector:
+    matchLabels:
+      app: claimx
+  template:
+    metadata:
+      labels:
+        app: claimx
+        role: inference # netpol: NATS + Ollama only, NO Postgres (§3.3)
+    spec:
+      serviceAccountName: claimx
+      automountServiceAccountToken: false
+      {{- include "na.pullSecrets" . | nindent 6 }}
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "compute" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 10001 | nindent 6 }}
+      containers:
+        - name: claimx
+          image: {{ include "na.image" (list "claimx" .Values) | quote }}
+          # the shared Dockerfile sets no CMD; each role names its module
+          command: ["python", "-m", "services.cluster.claimx"]
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          env:
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nats-claimx
+                  key: password
+            - name: NATS_URL
+              value: "nats://claimx:$(NATS_PASSWORD)@nats.zone-data.svc:4222"
+            - name: OLLAMA_URL
+              value: {{ .Values.claimx.ollamaUrl | quote }}
+            # Explicit — do NOT rely on the OllamaConfig default; the claim task must run
+            # the small non-reasoner, never the 4B.
+            - name: OLLAMA_MODEL
+              value: {{ .Values.claimx.model | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          resources: {{- toYaml .Values.claimx.resources | nindent 12 }}
+{{- end }}

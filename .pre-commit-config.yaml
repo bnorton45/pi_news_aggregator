@@ -1,0 +1,45 @@
+# Local secret-scanning + hygiene gates (PLAN §3.6 gate 2). CI re-runs over full
+# history (gate 3). gitleaks runs via its official container image (no Go needed).
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ^(\.secrets\.baseline|\.venv/)
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+        # Helm templates are Go-templated, not parseable YAML; they are validated
+        # for real via `helm lint/template | kubeconform` instead.
+        exclude: ^deploy/helm/.*/templates/
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (scan staged changes)
+        entry: ghcr.io/gitleaks/gitleaks:v8.18.4 protect --staged --redact --verbose
+        language: docker_image
+        pass_filenames: false
+      # The secret-hygiene ignore patterns (e.g. blanket `secrets.yaml`) must never
+      # silently swallow MANIFESTS — a flux/helm file that exists locally but not in
+      # git ships a broken deployment (bit us on 2026-07-02: chart credentials
+      # template + flux Kustomization were untracked for two commits).
+      - id: no-ignored-deploy-files
+        name: no gitignored files under deploy/ (rename, don't ignore)
+        entry: bash -c 'bad=$(git ls-files -oi --exclude-standard deploy | grep -v "^deploy/secrets/" || true); [ -z "$bad" ] || { echo "gitignored files inside deploy/ — rename them:"; echo "$bad"; exit 1; }'
+        language: system
+        pass_filenames: false

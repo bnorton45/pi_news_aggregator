@@ -1,0 +1,130 @@
+{{- if .Values.monitoring.enabled }}
+# Grafana (zone-data, beside its data source — PLAN §2/§7). User-facing but LAN-only:
+# the netpol `grafana-ingress` admits ONLY traefik (kube-system); `grafana-to-prometheus`
+# is its sole egress. Telemetry + update checks are disabled so it keeps the zone's
+# zero-internet-egress posture. No kube-API token (unlike Prometheus).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: zone-data
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.zone-data.svc:9090
+        isDefault: true
+        editable: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: zone-data
+spec:
+  selector:
+    app: grafana
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: zone-data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana # netpol key (deploy/policies)
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- if .Values.priorityClasses.enabled }}
+      priorityClassName: na-pipeline
+      {{- end }}
+      {{- include "na.nodeAffinity" (list "state" .Values) | nindent 6 }}
+      {{- include "na.podSecurity" 472 | nindent 6 }}
+      containers:
+        - name: grafana
+          image: {{ .Values.images.grafana | quote }}
+          {{- include "na.containerSecurity" . | nindent 10 }}
+          ports:
+            - { containerPort: 3000, name: http }
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: admin-password
+            - name: GF_SERVER_ROOT_URL
+              value: "http://{{ .Values.monitoring.grafana.host }}"
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            # Zero egress: never phone home for usage stats or update checks.
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES
+              value: "false"
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/grafana }
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          resources: {{- toYaml .Values.monitoring.grafana.resources | nindent 12 }}
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: zone-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.storage.className }}
+  resources:
+    requests:
+      storage: {{ .Values.monitoring.grafana.storage }}
+---
+# Host-routed through traefik (LAN-only; the netpol admits only the ingress controller).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: zone-data
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.monitoring.grafana.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port: { name: http }
+{{- end }}
